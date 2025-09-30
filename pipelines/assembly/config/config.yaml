@@ -1,0 +1,31 @@
+# Reference genome
+fasta_path_pk: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-67_PknowlesiA1H1_Genome.fasta"
+fasta_path_hg: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/human/GRCh38.p14/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna"
+
+# Reference GFF
+gff_path_pk: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-68_PknowlesiA1H1.gff"
+gff_path_hg: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/human/GRCh38.p14/ncbi_dataset/data/GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.gff"
+
+# STAR 
+star_path: "/g/data/pq84/software/STAR-2.7.1a/bin/Linux_x86_64/STAR"
+
+# .bed for reference genome
+bed_file_path: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/strain_A1_H.1.Icor.fasta.bed"
+
+# Data directory
+source_dir: "/g/data/pq84/malaria/Pk_trancsriptomics/data/fastq_combined"
+
+# Adapters
+adapters: "/g/data/pq84/malaria/Pk_trancsriptomics/data/adapters.fasta"
+
+# RNA-Bloom
+rna_bloom: "/g/data/pq84/bin/RNA-Bloom_v2.0.1/RNA-Bloom.jar"
+
+# Trinity_util
+trinity: "/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/"
+
+# Busco offline
+## DB for organism - to run offline
+busco_db: "/g/data/pq84/bin/busco/offline/busco_downloads/lineages/plasmodium_odb10"
+## All download files
+busco_offline: "/g/data/pq84/bin/busco/offline/busco_downloads/"

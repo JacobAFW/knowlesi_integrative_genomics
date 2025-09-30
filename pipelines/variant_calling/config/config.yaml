@@ -1,0 +1,20 @@
+# Reference genome
+fasta_path: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/strain_A1_H.1.Icor.fasta"
+
+# Pciard jar
+picard_path: "/g/data/pq84/bin/picard/build/libs/picard.jar"
+
+# GATK ajr
+gatk_path: "/g/data/pq84/bin/GenomeAnalysisTK-3.8-1-0/GenomeAnalysisTK.jar"
+
+# VCF of known indels
+known_indels_path: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/variants/TRUE_INDELs.vcf"
+
+# VCF of known sites
+known_sites_path: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/variants/TRUE_consensus.vcf"
+
+# .bed for reference genome
+bed_file_path: "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/strain_A1_H.1.Icor.fasta.bed"
+
+# Data directory
+source_dir: "/g/data/pq84/malaria/snakemake_play/data"

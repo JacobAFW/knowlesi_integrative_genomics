@@ -1,0 +1,99 @@
+__default__:
+  jobname: "smk-{rule}-{wildcards.sample}"
+  ncpus: 1
+  mem: "8GB"
+  walltime: "12:00:00"
+  storage: "gdata/pq84+scratch/pq84"
+  account: "jw1542"
+  queue: "normalbw"
+  email: "jacob.westaway@menzies.edu.au"
+  mailon: "a"
+  jobout: "oe"
+
+qc:
+  jobname: "smk-{rule}"
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+  
+bbduk:
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+star_index_pk:
+  jobname: "smk-{rule}"
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+star_index_hg:
+  jobname: "smk-{rule}"
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+star_aligner_pk:
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+star_aligner_hg:
+  ncpus: 10
+  mem: "100GB"
+  walltime: "24:00:00"
+
+trinity:
+  jobname: "smk-{rule}"
+  queue: "normalbw"
+  ncpus: 28
+  mem: "256GB"
+  walltime: "48:00:00"
+  jobout: "oe"
+
+cd_hit_clean:
+  jobname: "smk-{rule}"
+  ncpus: 10
+  mem: "256GB"
+  walltime: "24:00:00"
+
+trinity_abundances_prep:
+  jobname: "smk-{rule}"
+
+trinity_abundances:
+  jobname: "smk-{rule}"
+  ncpus: 28
+  mem: "100GB"
+  walltime: "48:00:00"
+
+trinity_isoform_matrix:
+  jobname: "smk-{rule}"
+  ncpus: 28
+  mem: "1020GB"
+  walltime: "48:00:00"
+  queue: "hugemembw"
+
+trinity_gene_matrix:
+  jobname: "smk-{rule}"
+  ncpus: 28
+  mem: "1020GB"
+  walltime: "48:00:00"
+  queue: "hugemembw"
+
+busco_quality_trinity:
+  jobname: "smk-{rule}"
+  ncpus: 28
+  mem: "100GB"
+  walltime: "24:00:00"
+
+transabyss_merge_assemblies:
+  jobname: "smk-{rule}"
+  ncpus: 21
+  mem: "128GB"
+  walltime: "48:00:00"
+
+transdecoder_coding_regions:
+  jobname: "smk-{rule}"
+  ncpus: 10
+  mem: "80GB"
+  walltime: "48:00:00"

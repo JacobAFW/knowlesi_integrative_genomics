@@ -1,0 +1,62 @@
+__default__:
+  jobname: "smk-{rule}-{wildcards.sample}"
+  ncpus: 1
+  mem: "8GB"
+  walltime: "12:00:00"
+  storage: "gdata/pq84+scratch/pq84"
+  account: "jw1542"
+  queue: "normalbw"
+  email: "jacob.westaway@menzies.edu.au"
+  mailon: "a"
+  jobout: "oe"
+
+bwa_map:
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+realigner_target_creator: 
+  ncpus: 5
+  mem: "50GB"
+  walltime: "24:00:00"
+
+haplotype_caller: 
+  ncpus: 3
+  mem: "24GB"
+  walltime: "48:00:00"
+
+combine_gvcfs: 
+  jobname: "smk-{rule}"
+  ncpus: 3
+  mem: "24GB"
+  walltime: "48:00:00"
+
+joint_genotyping: 
+  jobname: "smk-{rule}"
+  ncpus: 3
+  mem: "24GB"
+  walltime: "48:00:00"
+
+bcftools_caller: 
+  jobname: "smk-{rule}"
+  ncpus: 2
+  mem: "16GB"
+  walltime: "48:00:00"
+
+concat_bcftools: 
+  jobname: "smk-{rule}"
+  ncpus: 2
+  mem: "16GB"
+  walltime: "48:00:00"
+
+consensus_of_vcfs:
+  jobname: "smk-{rule}"
+  ncpus: 2
+  mem: "16GB"
+  walltime: "48:00:00"
+
+concat_vcfs:
+  jobname: "smk-{rule}"
+  ncpus: 2
+  mem: "16GB"
+  walltime: "12:00:00"

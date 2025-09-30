@@ -1,0 +1,418 @@
+# Snakefile 
+# Prerequisites (on Gadi): source /g/data/pq84/malaria/snakemake_pipeline/snakemake_setup.sh
+
+
+################################################ Define paths using config file #########################################################################
+
+
+configfile: "config/config.yaml"
+fasta_path_pk=config['fasta_path_pk']
+fasta_path_hg=config['fasta_path_hg']
+bed_file_path=config['bed_file_path']
+gff_path_pk=config['gff_path_pk']
+gff_path_hg=config['gff_path_hg']
+star_path=config['star_path']
+source_dir=config['source_dir']
+adapters=config['adapters']
+busco_db=config['busco_db']
+busco_offline=config['busco_offline']
+
+################################################ Set up: define input files, wildcards, etc. #########################################################################
+
+## Defining the samples to be used for the {sample} wildcard
+SAMPLES, = glob_wildcards(f'{source_dir}/{{sample}}_1.fq.gz') 
+
+################################################## Define final files #######################################################################
+
+rule all:
+    input:
+        "output/trinity_assembly/trans_abundance/trinity.gene.counts.matrix"
+
+###################################################### Rules ##############################################################################
+
+# Define local rules - not run with scheduler
+localrules: all, sample_list_trinity
+
+# TRINITY ########################################################################################################### 
+
+# Get isoform and gene abundances from trinity
+trin_abun_pfx="output/trinity_assembly/trans_abundance/"
+
+rule trinity_gene_matrix:
+    input:
+        genes=expand(f"{trin_abun_pfx}{{sample}}/RSEM.genes.results", sample = SAMPLES),
+        trinity_gene_map="output/trinity_assembly/trinity_assembly_unique.Trinity.fasta.gene_trans_map"
+    output:
+        *[trin_abun_pfx + filename for filename in [
+            'trinity.gene.counts.matrix'
+            ]]
+    params:
+        trin_abun_pfx=f"{trin_abun_pfx}/trinity",
+        input_list=lambda w: " ".join(expand(f"{trin_abun_pfx}{{sample}}/RSEM.genes.results", sample = SAMPLES))
+    shell:
+        """
+        /g/data/pq84/bin/trinityrnaseq-v2.15.1/util/abundance_estimates_to_matrix.pl \
+        --est_method RSEM  \
+        --cross_sample_norm none \
+        --gene_trans_map {input.trinity_gene_map} \
+        --out_prefix {params.trin_abun_pfx} \
+        --name_sample_by_basedir \
+        {params.input_list}
+        """
+
+trin_fast_pfx="output/trinity_assembly/"
+
+rule trinity_abundances:
+    input:
+        trinity_fasta="output/trinity_assembly/trinity_assembly_unique.Trinity.fasta",
+        trinity_gene_map="output/trinity_assembly/trinity_assembly_unique.Trinity.fasta.gene_trans_map",
+        f_in="output/mapped/human/fixed_{sample}_Unmapped.out.mate1",
+        r_in="output/mapped/human/fixed_{sample}_Unmapped.out.mate2",
+        index=f"{trin_fast_pfx}trinity_assembly_unique.Trinity.fasta.bowtie2.rev.1.bt2"
+    output:
+        *[trin_abun_pfx + filename for filename in [
+            '{sample}/RSEM.isoforms.results',
+            '{sample}/RSEM.genes.results'
+            ]]
+    params:
+        trin_abun_pfx=f"{trin_abun_pfx}{{sample}}"
+    shell:
+        """
+        /g/data/pq84/bin/trinityrnaseq-v2.15.1/util/align_and_estimate_abundance.pl \
+        --transcripts {input.trinity_fasta} \
+        --seqType fq \
+        --left {input.f_in} --right {input.r_in} \
+        --est_method RSEM \
+        --aln_method bowtie2 \
+        --gene_trans_map {input.trinity_gene_map} \
+        --output_dir {params.trin_abun_pfx} \
+        --SS_lib_type RF \
+        --thread_count 28
+        """
+
+rule trinity_abundances_prep:
+    input:
+        f"{trin_fast_pfx}trinity_assembly_unique.Trinity.fasta"
+    output:
+        *[trin_fast_pfx + filename for filename in [
+            'trinity_assembly_unique.Trinity.fasta.RSEM.transcripts.fa',
+            'trinity_assembly_unique.Trinity.fasta.RSEM.seq',
+            'trinity_assembly_unique.Trinity.fasta.bowtie2.rev.1.bt2',
+            'trinity_assembly_unique.Trinity.fasta.bowtie2.rev.2.bt2'
+            ]]
+    shell:
+        """
+        /g/data/pq84/bin/trinityrnaseq-v2.15.1/util/align_and_estimate_abundance.pl \
+        --transcripts {input} \
+        --prep_reference \
+        --est_method RSEM \
+        --aln_method bowtie2 
+        """
+
+# Remove duplicates
+rule cd_hit_clean:
+    input:
+        f"{trin_fast_pfx}trinity_assembly.Trinity.fasta"
+    output:
+        fasta=f"{trin_fast_pfx}trinity_assembly_unique.Trinity.fasta",
+        trans_map=f"{trin_fast_pfx}trinity_assembly_unique.Trinity.fasta.gene_trans_map"
+    shell:
+        """
+        cd-hit-est -i {input} -o {output.fasta} -c 0.95 -n 10 -p 1 -g 1 -M 256000 -T 10 -d 40
+        /g/data/pq84/bin/trinityrnaseq-v2.15.1/util/support_scripts/get_Trinity_gene_to_trans_map.pl \
+        {output.fasta} > {output.trans_map}
+        """
+
+# Assemble with trinity - trinity assembly compeleted on Ada
+
+rule trinity:
+    input:
+        sample_files="output/mapped/human/sample_files.txt",
+        f_in=expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate1", sample = SAMPLES),
+        r_in=expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate2", sample = SAMPLES)
+    output:
+        "output/trinity_assembly/trinity_assembly.Trinity.fasta",
+        "output/trinity_assembly/trinity_assembly.Trinity.fasta.gene_trans_map"
+    params:
+        left_list=lambda w: ",".join(expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate1", sample = SAMPLES)),
+        right_list=lambda w: ",".join(expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate2", sample = SAMPLES)),
+        out_pfx=f"{trin_fast_pfx}trinity_assembly"
+    log:
+        err='output/trinity_assembly/trinity_assembly.err.log'
+    shell:
+        """
+        Trinity \
+        --seqType fq \
+        --max_memory 50G \
+        --min_kmer_cov 2 \
+        --no_parallel_norm_stats \
+        --samples_file {input.sample_files} \
+        --normalize_by_read_set \
+        --CPU 28 \
+        --SS_lib_type RF \
+        --output {params.out_pfx}
+        """
+
+# Generate sample list for trinity input - not needed, trinity assembly already completed
+
+rule sample_list_trinity:
+    input:
+        expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate1", sample = SAMPLES),
+        expand("output/mapped/human/fixed_{sample}_Unmapped.out.mate2", sample = SAMPLES)
+    output:
+        "output/mapped/human/sample_files.txt"
+    run:
+        import os
+
+        # Define the directory to scan
+        directory = pfx_hg
+
+        # Define the output file
+        output_file = pfx_hg + "sample_files.txt"
+
+        # Scan the directory for files
+        files = sorted(os.listdir(directory))
+
+        # Filter the files as needed (e.g., to include only "mate1" and "mate2" files)
+        filtered_files = [file for file in files if "fixed" in file and ("mate1" in file or "mate2" in file)]
+
+        # Group files by their fixed sample names (before "_Unmapped")
+        sample_dict = {}
+        for file in filtered_files:
+            fixed_sample_name = file.split("_Unmapped")[0]  # Extract the fixed sample name
+            if fixed_sample_name not in sample_dict:
+                sample_dict[fixed_sample_name] = []
+            sample_dict[fixed_sample_name].append(file)
+
+        # Format the output with the first and second columns identical to the fixed sample name
+        with open(output_file, "w") as f:
+            for fixed_sample_name, file_list in sample_dict.items():
+                if len(file_list) == 2:  # Ensure there are exactly two files (mate1 and mate2) for each sample
+                    f.write("\t".join([
+                        fixed_sample_name,        # First column: Fixed sample name
+                        fixed_sample_name,        # Second column: Fixed sample name (identical to the first)
+                        os.path.join(directory, file_list[0]),  # Full path to mate1
+                        os.path.join(directory, file_list[1])   # Full path to mate2
+                    ]) + "\n")
+
+
+# Amend files for trinity - already run on Ada
+
+rule fix_header_for_trinity:
+    input:
+        f_in="output/mapped/human/{sample}_Unmapped.out.mate1",
+        r_in="output/mapped/human/{sample}_Unmapped.out.mate2"
+    output:
+        f_out=temp("output/mapped/human/fixed_{sample}_Unmapped.out.mate1"),
+        r_out=temp("output/mapped/human/fixed_{sample}_Unmapped.out.mate2")
+    run:
+        with open(input.f_in, "rt") as file_in:
+            with open(output.f_out, "wt") as file_out:
+                for line in file_in:
+                    file_out.write(line.replace('0:N', '1:N'))
+
+        with open(input.r_in, "rt") as file_in:
+            with open(output.r_out, "wt") as file_out:
+                for line in file_in:
+                    file_out.write(line.replace('1:N', '2:N'))
+
+
+# QC ###########################################################################################################  
+
+# Map to Pk with STAR using unmapped reads post mapping to hg
+
+## Max intron size of Pf is ~1000 & min is 5- specified in input
+
+pfx_pk="output/mapped/"
+
+rule star_aligner_pk:
+    input:
+        "output/genome_index/Genome",
+        "output/genome_index/SA",
+        "output/genome_index/SAindex",
+        star=star_path,
+        f_in="output/mapped/human/{sample}_Unmapped.out.mate1",
+        r_in="output/mapped/human/{sample}_Unmapped.out.mate2"
+    output:
+        *[pfx_pk + filename for filename in [
+            '{sample}_Aligned.sortedByCoord.out.bam',
+            '{sample}_Log.final.out',
+            '{sample}_Log.out',
+            '{sample}_Log.progress.out',
+            '{sample}_SJ.out.tab',
+            '{sample}_ReadsPerGene.out.tab'
+            ]]
+    params:
+        pfx_pk=f"{pfx_pk}{{sample}}_",
+        genome="output/genome_index"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --genomeDir {params.genome} \
+        --readFilesIn {input.f_in} {input.r_in} \
+        --outSAMtype BAM SortedByCoordinate \
+	    --outFileNamePrefix {params.pfx_pk} \
+	    --outSAMattributes Standard \
+        --alignIntronMin 5 \
+        --limitBAMsortRAM 1847354302 \
+        --alignIntronMax 1000 \
+        --quantMode GeneCounts
+        """
+
+# Map to hg with STAR
+
+## Max intron size of Pf is ~1000 & min is 5- specified in input
+
+pfx_hg="output/mapped/human/"
+
+rule star_aligner_hg:
+    input:
+        "output/genome_index/human/Genome",
+        "output/genome_index/human/SA",
+        "output/genome_index/human/SAindex",
+        star=star_path,
+        f_in="output/trimmed/{sample}_trimmed_1.fq.gz",
+        r_in="output/trimmed/{sample}_trimmed_2.fq.gz"
+    output:
+        *[temp(pfx_hg + filename) for filename in [
+            '{sample}_Aligned.sortedByCoord.out.bam',
+            '{sample}_Log.final.out',
+            '{sample}_Log.out',
+            '{sample}_Log.progress.out',
+            '{sample}_SJ.out.tab',
+            '{sample}_ReadsPerGene.out.tab',
+            '{sample}_Unmapped.out.mate1',
+            '{sample}_Unmapped.out.mate2'
+            ]]
+    params:
+        pfx_hg=f"{pfx_hg}{{sample}}_",
+        genome="output/genome_index/human"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --genomeDir {params.genome} \
+        --readFilesIn {input.f_in} {input.r_in} \
+        --readFilesCommand zcat \
+        --outSAMtype BAM SortedByCoordinate \
+	    --outFileNamePrefix {params.pfx_hg} \
+	    --outSAMattributes Standard \
+        --alignIntronMin 5 \
+        --limitBAMsortRAM 3285941848 \
+        --alignIntronMax 1000 \
+        --quantMode GeneCounts \
+        --outReadsUnmapped Fastx 
+        """
+
+# Index genomes for mapping STAR
+
+## Pk
+
+pfx_pk_index="output/genome_index/"
+
+rule star_index_pk:
+    input:
+        fasta_pk=fasta_path_pk,
+        gff_pk=gff_path_pk,
+        star=star_path
+    output:
+        *[pfx_pk_index + filename for filename in [
+            'Genome','SA','SAindex','chrLength.txt','chrName.txt',
+            'chrStart.txt','exonGeTrInfo.tab','exonInfo.tab',
+            'geneInfo.tab','genomeParameters.txt',
+            'sjdbList.fromGTF.out.tab','sjdbList.out.tab',
+            'transcriptInfo.tab'
+            ]]
+    params:
+        "output/genome_index"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --runMode genomeGenerate \
+        --genomeSAindexNbases 11 \
+        --genomeDir {params} \
+        --genomeFastaFiles {input.fasta_pk} \
+        --sjdbGTFfile {input.gff_pk} \
+        --sjdbGTFtagExonParentTranscript Parent \
+        --sjdbGTFfeatureExon exon \
+        --sjdbOverhang 149 \
+        --outFilterMultimapNmax 20
+        """
+
+# Human
+
+pfx_hg_index="output/genome_index/human/"
+
+rule star_index_hg:
+    input:
+        fasta_hg=fasta_path_hg,
+        gff_hg=gff_path_hg,
+        star=star_path
+    output:
+        *[pfx_hg_index + filename for filename in [
+            'Genome','SA','SAindex','chrLength.txt','chrName.txt',
+            'chrStart.txt','exonGeTrInfo.tab','exonInfo.tab',
+            'geneInfo.tab','genomeParameters.txt',
+            'sjdbList.fromGTF.out.tab','sjdbList.out.tab',
+            'transcriptInfo.tab'
+            ]]
+    params:
+        "output/genome_index/human"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --runMode genomeGenerate \
+        --genomeSAindexNbases 11 \
+        --genomeDir {params} \
+        --genomeFastaFiles {input.fasta_hg} \
+        --sjdbGTFfile {input.gff_hg} \
+        --sjdbGTFtagExonParentTranscript Parent \
+        --sjdbGTFfeatureExon exon \
+        --sjdbOverhang 149 \
+        --outFilterMultimapNmax 20
+        """
+
+
+# Remove adapaters
+
+rule bbduk:
+    input:
+        adapters=adapters,
+        f_in=f"{source_dir}/{{sample}}_1.fq.gz",
+        r_in=f"{source_dir}/{{sample}}_2.fq.gz"
+    output:
+        f_out=temp("output/trimmed/{sample}_trimmed_1.fq.gz"),
+        r_out=temp("output/trimmed/{sample}_trimmed_2.fq.gz"),
+        stats="output/trimmed/{sample}.stats"
+    shell:
+        """
+        bbduk.sh \
+        in1={input.f_in} in2={input.r_in} \
+        out1={output.f_out} out2={output.r_out} \
+        ktrim=r \
+        k=12 \
+        mink=6 \
+        hdist=1 \
+        ref={input.adapters} \
+        tpe \
+        tbo \
+        stats={output.stats}
+        """
+
+# QC fastq files
+
+rule qc:
+    input:
+        source_dir
+    output:
+        expand("output/fastqc/{sample}_1_fastqc.html", sample = SAMPLES)
+    params:
+        in_dir=f"{source_dir}/*fq.gz",
+        out="output/fastqc/"
+    shell:
+        """
+        fastqc -t 5 -o {params.out} {params.in_dir}
+        """

@@ -1,0 +1,10 @@
+name: all
+dependencies:
+  - bcftools=1.12 
+  - python=3.9.2
+  - jdk=8.40 
+  - R=4.1.0 
+  - samtools=1.12  
+  - bwa=0.7.17 
+  - GATK=3.8-1-0
+  - picard=2.26.10
