@@ -44,7 +44,7 @@ A key finding is the transcriptional divergence between stress-response programs
 
 All analyses were designed with transparency in mind, using modular Snakemake workflows and version-controlled scripts.
 
-However, the repository contains more than 18,000 lines of code, spanning pipelines for variant detection, transcriptomic assembly and quantification, differential expression, eQTL mapping, functional annotation, and figure generation.
+However, the repository contains more than 18,000 lines of code and comments, spanning pipelines for variant detection, transcriptomic assembly and quantification, differential expression, eQTL mapping, functional annotation, and figure generation.
 
 So, if you are interested in replicating or adapting any part of this workflow for your own research, feel free to reach out — I am happy to help.
 
