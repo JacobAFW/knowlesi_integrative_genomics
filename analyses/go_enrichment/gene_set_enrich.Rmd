@@ -1,0 +1,771 @@
+# Prepare environment
+
+```{bash,eval=F}
+start_pbs_big_boy
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+module load python3/3.12.1
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv
+```
+
+# Extract GO terms from the PKA1H1 GFF
+
+```{R,eval=F}
+library(tidyverse)
+library(stringr)
+library(SummarizedExperiment)
+library(GO.db)
+library(enrichplot)
+
+# Step 1: Load GO annotations from the GAF file
+pka1h1_go <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-68_PknowlesiA1H1_GO.gaf",
+    comment = "!",
+    col_names = FALSE
+    ) %>%
+    transmute(
+        gene_id = X2,        # Column 2 = PKA1H1 gene ID
+        GO_term = X5         # Column 5 = GO ID
+    ) %>%
+    distinct()
+
+# Step 2: Load mapping from gffcompare .tracking file
+trinity_to_pka1h <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+                                col_names = FALSE, comment = "#") %>%
+    transmute(
+        pka1h_gene = str_extract(X3, "PKA1H_\\d{9}"),
+        trinity_id = str_extract(X5, "TRINITY_[^|]+")
+    ) %>%
+    filter(!is.na(pka1h_gene), !is.na(trinity_id)) %>%
+    distinct()
+
+# Step 3: Merge to get GO terms for Trinity IDs
+trinity_go <- trinity_to_pka1h %>%
+    left_join(pka1h1_go, by = c("pka1h_gene" = "gene_id")) %>%
+    filter(!is.na(GO_term)) %>%
+    distinct(trinity_id, GO_term) %>%
+    mutate(trinity_id = str_remove(trinity_id, "\\.path1"))
+
+# Add source identifiers before binding
+go_pka1h <- trinity_go %>%
+    dplyr::rename(transcript_id = trinity_id) %>%
+    mutate(source = "pka1h")
+```
+
+# Merge PKA1H GO terms with Trinotate GO terms 
+
+```{R,eval=F}
+# Trinotate GO terms
+trinotate_go <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond/trinity_assembly_unique_non_cod.Trinotate.tsv") %>%
+    dplyr::select(transcript_id, gene_ontology_BLASTX, gene_ontology_BLASTP, gene_ontology_Pfam) %>%
+    filter_at(vars(starts_with("gene_ontology_")), any_vars(. != "." & !is.na(.)))
+
+# Combine the GO columns
+go_long <- trinotate_go %>%
+    pivot_longer(cols = starts_with("gene_ontology_"),
+                names_to = "source", values_to = "go_raw") %>%
+    filter(!is.na(go_raw) & go_raw != ".") %>%
+    separate_rows(go_raw, sep = "`") %>%
+    separate(go_raw, into = c("GO_term", "namespace", "desc"), sep = "\\^", extra = "drop") %>%
+    filter(str_detect(GO_term, "^GO:"))
+
+# Combine and prioritize GO sources: pka1h > BLASTX > BLASTP > PFAM
+go_combined <- bind_rows(go_pka1h, go_long) %>%
+    mutate(source = factor(source, levels = c("pka1h", "gene_ontology_BLASTX", "gene_ontology_BLASTP", "gene_ontology_Pfam"))) %>%
+    mutate(transcript_id = str_remove(transcript_id, "_i\\d+$")) %>%
+    arrange(transcript_id, source) %>%
+    group_by(transcript_id, GO_term) %>%  # Ensure deduplication across sources
+    slice_head(n = 1) %>%
+    ungroup()
+
+# Fix missing pka1h1 namespace and desc
+# Step 1: Pull missing GO terms
+go_missing <- go_combined %>%
+  filter(is.na(desc) | is.na(namespace)) %>%
+  distinct(GO_term) %>%
+  filter(!is.na(GO_term))
+
+
+# Step 2: Keep only terms that exist in GO.db
+valid_terms <- go_missing$GO_term[go_missing$GO_term %in% keys(GO.db::GOTERM)]
+
+# Step 3: Safely retrieve info
+go_filled <- tibble(
+  GO_term = valid_terms,
+  desc = Term(GOTERM[valid_terms]),
+  namespace = Ontology(GOTERM[valid_terms])
+)
+
+# Step 4: Join back to go_combined to patch missing values only
+go_combined <- go_combined %>%
+  left_join(go_filled, by = "GO_term") %>%
+  mutate(
+    desc = coalesce(desc.x, desc.y),
+    namespace = coalesce(namespace.x, namespace.y)
+  ) %>%
+  dplyr::select(transcript_id, GO_term, source, namespace, desc) %>%
+  mutate(namespace = ifelse(namespace == "BP", "biological_process", 
+    ifelse(namespace == "CC", "cellular_component",
+    ifelse(namespace == "MF", "molecular_function", namespace))))
+
+go_combined %>% group_by(namespace) %>% summarise(n = n())
+
+write_tsv(go_combined, "go_combined.tsv")
+#go_combined <- read_tsv("go_combined.tsv")
+```
+
+# Prepare DE genes
+
+```{R,eval=F}
+# DE gene list — from your analysis
+# Ensure it matches the transcript_id in go_combined
+de_transcripts <- read_tsv("significant_overlap_with_nonzero_counts.tsv") %>%
+    dplyr::rename(transcript_id = gene) %>%
+    select(transcript_id)
+
+# All gene list
+filtered_summarized <- readRDS("summarized_de_filter.rds")
+
+filtered_transcripts <- assay(filtered_summarized) %>%
+  as.data.frame() %>%
+  rownames_to_column("transcript_id") %>%
+  select(transcript_id) 
+
+# Binary vector: 1 if DE, 0 if not
+gene_vector <- as.integer(filtered_transcripts$transcript_id %in% de_transcripts$transcript_id)
+names(gene_vector) <- filtered_transcripts$transcript_id
+
+# Two columns: transcript_id, GO_term
+go_combined_formatted <- go_combined %>%
+    mutate(transcript_id = str_remove(transcript_id, "_i\\d+$")) %>%
+    filter(transcript_id %in% filtered_transcripts$transcript_id) %>%
+    distinct(transcript_id, GO_term)
+
+write_tsv(go_combined_formatted, "go_combined_formatted.tsv")
+#go_combined_formatted <- read_tsv("go_combined_formatted.tsv")
+```
+
+
+# Run goseq enrichment
+
+```{R,eval=F}
+library(goseq)
+library(Biostrings)
+
+# Format GO list for goseq
+# Named list: transcript -> vector of GO terms
+gene2cat <- split(go_combined_formatted$GO_term, go_combined_formatted$transcript_id)
+
+# Estimate probability weighting function (PWF)
+
+## Compute transcript lengths
+fasta <- readDNAStringSet("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/trinity_assembly/trinity_assembly_unique.Trinity.fasta")
+lengths <- width(fasta)
+names(lengths) <- sub(" .*", "", names(fasta))  # strip after first space
+names(lengths) <- sub("_i\\d+$", "", names(lengths))
+lengths <- lengths[names(gene_vector)]
+
+pwf <- nullp(gene_vector, bias.data = lengths)
+
+# Run GOseq enrichment test
+go_results <- goseq(pwf, gene2cat = gene2cat) %>%
+    mutate(FDR = p.adjust(over_represented_pvalue, method = "BH"))
+
+go_sig_results <- go_results %>% 
+    filter(FDR < 0.01) %>%
+    left_join(
+        go_combined %>% 
+            select(GO_term, namespace, desc) %>%
+            dplyr::rename(category = GO_term, term = desc) %>%
+            distinct()
+    ) %>%
+    mutate(namespace = ifelse(category == "GO:0006346", "biological_process", namespace))
+
+# Add GO term descriptions
+go_term_sources <- go_combined %>%
+  select(transcript_id, GO_term, source) %>%
+  distinct()
+
+go_term_to_source <- go_term_sources %>%
+  group_by(GO_term) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+go_sig_results <- go_sig_results %>%
+  left_join(go_term_to_source, by = c("category" = "GO_term"))
+
+write_tsv(go_sig_results, "goseq/go_enrichment_results.tsv")
+#go_sig_results <- read_tsv("goseq/go_enrichment_results.tsv")
+
+p <- go_sig_results %>%
+  arrange(FDR) %>%
+  ggplot(aes(x = reorder(term, -FDR), y = -log10(FDR), fill = namespace)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = "GO Term", y = "-log10(FDR)", title = "Top Enriched GO Terms") +
+    facet_wrap(~ namespace, scales = "free_y") +
+    scale_fill_manual(values = c("biological_process" = "#440154FF", "molecular_function" = "#d44842", "cellular_component" = "#21908CFF")) +
+    theme(legend.position = "none")
+
+ggsave("goseq/go_enrichment_plot.png", plot = p, width = 20, height = 6, dpi = 300)
+```
+
+
+
+
+########################################################################################
+
+
+# Run with gseGO 
+
+```{R,eval=F}
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(patchwork)
+library(ComplexUpset)
+
+# Step 1: Prepare logFC vector from consensusDE
+# Load filtered expression set
+filtered_summarized <- readRDS("summarized_de_filter.rds")
+
+colData(summarised_de_filter)$group <- relevel(colData(summarised_de_filter)$group, ref = "Um")
+
+# Extract logFC from your full DE analysis
+all_logfc <- read_tsv("voom_results_full.tsv") %>% 
+  mutate(transcript_id = gene) %>%
+  distinct(transcript_id, logFC)
+
+# Vector for GSEA
+gene_list <- all_logfc$logFC
+names(gene_list) <- all_logfc$transcript_id
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+# Step 2: Prepare TERM2GENE and TERM2NAME from your GO annotations
+go_combined <- read_tsv("go_combined.tsv")
+
+term2gene <- go_combined %>%
+  distinct(GO_term, transcript_id) %>%
+  mutate(transcript_id = str_remove(transcript_id, "_i\\d+$"))  # if needed
+
+term2name <- go_combined %>%
+  distinct(GO_term, desc) %>%
+  rename(term_name = desc)
+
+
+# Step 3: Run GSEA with gseGO-style input
+gsea_result <- GSEA(geneList = gene_list,
+                    TERM2GENE = term2gene,
+                    TERM2NAME = term2name,
+                    pvalueCutoff = 0.05,
+                    verbose = TRUE)
+
+```
+
+# Visualise results
+
+```{R,eval=F}
+# Create an output directory
+outdir <- "gsea_plots"
+dir.create(outdir, showWarnings = FALSE)
+
+# dot plot
+# Attach GO namespace info (ensuring one-to-one ID → namespace mapping)
+namespace_map <- go_combined %>%
+    distinct(GO_term, namespace) %>%
+    filter(!is.na(namespace)) %>%
+    rename(ID = GO_term) %>%
+    mutate(namespace = str_replace(namespace, "_", " ")) 
+
+# Merge into gsea_result
+gsea_result@result <- gsea_result@result %>%
+    left_join(namespace_map, by = "ID") 
+
+gsea_result@result$Description <- str_replace_all(
+    gsea_result@result$Description, " ", "\u00A0"
+)
+
+p3 <- dotplot(gsea_result, showCategory = 15, split = "namespace") +
+    facet_grid(
+        namespace ~ .sign,
+        scales = "free_y",
+        space = "free",
+        labeller = labeller(.sign = c(
+        activated = "Severe",
+        suppressed = "Uncomplicated"
+        ))
+    ) +
+    scale_fill_viridis_c(option = "D") +
+    theme(
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.title = element_text(size = 18),
+        plot.title = element_text(size = 20),     
+        axis.text.y = element_text(hjust = 1, size = 14)
+    )
+
+ggsave("gsea_plots/dotplot_split_namespace_2.png", plot = p3, width = 16, height = 20, dpi = 300)
+
+# GSEA plots
+p4 <- gseaplot(gsea_result, geneSetID = gsea_result@result$ID[1], by = "runningScore")
+ggsave("gsea_plots/gseaplot_top1.png", plot = p4, width = 12, height = 10, dpi = 300)
+
+# Step 1: Get top 15 GO terms per namespace
+top_terms_per_ns <- gsea_result@result %>%
+    group_by(namespace) %>%
+    slice_min(order_by = p.adjust, n = 15) %>%
+    ungroup() %>%
+    select(ID, Description, namespace)
+
+# Step 2: Loop through each namespace
+namespaces <- unique(top_terms_per_ns$namespace)
+
+for (ns in namespaces) {
+    message("Processing: ", ns)
+
+    subset_terms <- top_terms_per_ns %>% filter(namespace == ns)
+
+    plots <- lapply(seq_len(nrow(subset_terms)), function(i) {
+        id <- subset_terms$ID[i]
+        desc <- subset_terms$Description[i]
+
+        # Wrap in tryCatch in case a term fails
+        tryCatch({
+        gseaplot(gsea_result, geneSetID = id, by = "runningScore", color = "#440154FF") +
+            ggtitle(desc)
+        }, error = function(e) {
+        message("Failed to plot ", id, ": ", e$message)
+        NULL
+        })
+    })
+
+    # Remove NULLs (failed plots)
+    plots <- Filter(Negate(is.null), plots)
+
+    if (length(plots) > 0) {
+        plot_grid <- wrap_plots(plots, ncol = 3)
+        ggsave(
+        filename = paste0("gsea_plots/gseaplot_grid_", ns, ".png"),
+        plot = plot_grid,
+        width = 20, height = 15, dpi = 300
+        )
+    } else {
+        message("No valid plots for ", ns)
+    }
+    }
+
+# Upset plots for top 15 GO terms per namespace
+# Extract GO term to gene mapping
+term_gene_df <- gsea_result@result %>%
+    # Keep only top 15 GO terms per namespace
+    group_by(namespace) %>%
+    slice_min(order_by = p.adjust, n = 15) %>%
+    ungroup() %>%
+    # Expand core_enrichment field into one row per gene
+    separate_rows(core_enrichment, sep = "/") %>%
+    rename(core_gene = core_enrichment) %>%
+    select(namespace, ID, Description, core_gene) %>%
+    mutate(
+        Description = str_replace_all(Description, "\\s+", " "),   # Normalize whitespace
+        Description = str_replace_all(Description, "\u00a0", " "))
+
+# Loop over each GO namespace
+for (ns in na.omit(unique(term_gene_df$namespace))) {
+    subset_df <- term_gene_df %>% filter(namespace == ns)
+  
+  # Create binary matrix: genes x GO term Descriptions
+    binary_mat <- subset_df %>%
+        select(core_gene, Description) %>%
+        distinct() %>%
+        mutate(value = 1) %>%
+        pivot_wider(names_from = Description, values_from = value, values_fill = 0)
+
+  # Make gene column first
+  binary_mat <- binary_mat %>% relocate(core_gene)
+
+  # Generate UpSet plot
+  p_upset <- ComplexUpset::upset(
+    binary_mat,
+    intersect = colnames(binary_mat)[-1],
+    base_annotations = list(
+      'Intersection size' = intersection_size(text = list(size = 2))
+    ),
+    set_sizes = upset_set_size()
+  )
+  
+  # Save
+  ggsave(
+    filename = paste0("gsea_plots/upset_top15_", gsub(" ", "_", ns), ".png"),
+    plot = p_upset,
+    width = 18,
+    height = 8,
+    dpi = 300
+  )
+}
+
+
+
+# Step 4: Summary of top results
+# Ensure namespace column exists in the GSEA result
+gsea_result@result$namespace <- factor(gsea_result@result$namespace)
+
+# Create summary table of top 30 GO terms per namespace
+gsea_summary <- gsea_result@result %>%
+  mutate(
+    GeneRatio = sapply(strsplit(core_enrichment, "/"), length) / setSize
+  ) %>%
+  group_by(namespace) %>%
+  slice_min(order_by = p.adjust, n = 50) %>%
+  ungroup() %>%
+  transmute(
+    namespace,
+    Description,
+    GO_term = ID,
+    GeneRatio = round(GeneRatio, 3),
+    NES = round(NES, 2),
+    pvalue = signif(pvalue, 3),
+    p.adjust = signif(p.adjust, 3)
+  ) %>%
+  mutate(
+    Description = str_replace_all(Description, "\\s+", " "),   # Normalize whitespace
+    Description = str_replace_all(Description, "\u00a0", " "))
+
+write_csv(gsea_summary, "gsea_plots/gsea_summary_top50.csv")
+
+```
+
+
+# GO terms of interest
+```{R,eval=F}
+library(forcats)
+library(SummarizedExperiment)
+library(edgeR)
+library(viridis)
+library(scales)
+
+# GO terms of interest (manually curated from top 50)
+interesting_go <- read_tsv("gsea_plots/gsea_summary_interest.tsv")
+go_ids <- interesting_go$GO_term
+
+gsea_subset <- gsea_result
+gsea_subset@result <- gsea_result@result %>%
+  filter(ID %in% go_ids)
+
+# Dot plot
+p3 <- dotplot(gsea_subset, showCategory = 15, split = "namespace") +
+    facet_grid(namespace ~ .sign, scales = "free_y", space = "free") +
+    scale_fill_viridis_c(option = "D") +
+    theme(
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18),
+        strip.text = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.title = element_text(size = 18),
+        plot.title = element_text(size = 20),     
+        axis.text.y = element_text(hjust = 1, size = 14)
+    )
+
+ggsave("gsea_plots/dotplot_split_namespace_interesting.png", plot = p3, width = 16, height = 20, dpi = 300)
+
+
+# GSEA plots
+## Get top 15 GO terms per namespace
+top_terms_per_ns <- gsea_subset@result %>%
+    group_by(namespace) %>%
+    slice_min(order_by = p.adjust, n = 15) %>%
+    ungroup() %>%
+    select(ID, Description, namespace)
+
+## Loop through each namespace
+namespaces <- unique(top_terms_per_ns$namespace)
+
+for (ns in namespaces) {
+    message("Processing: ", ns)
+
+    subset_terms <- top_terms_per_ns %>% filter(namespace == ns)
+
+    plots <- lapply(seq_len(nrow(subset_terms)), function(i) {
+        id <- subset_terms$ID[i]
+        desc <- subset_terms$Description[i]
+
+        # Wrap in tryCatch in case a term fails
+        tryCatch({
+        gseaplot(gsea_result, geneSetID = id, by = "runningScore", color = "#440154FF") +
+            ggtitle(desc)
+        }, error = function(e) {
+        message("Failed to plot ", id, ": ", e$message)
+        NULL
+        })
+    })
+
+    # Remove NULLs (failed plots)
+    plots <- Filter(Negate(is.null), plots)
+
+    if (length(plots) > 0) {
+        plot_grid <- wrap_plots(plots, ncol = 3)
+        ggsave(
+        filename = paste0("gsea_plots/gseaplot_grid_interesting_", ns, ".png"),
+        plot = plot_grid,
+        width = 20, height = 15, dpi = 300
+        )
+    } else {
+        message("No valid plots for ", ns)
+    }
+    }
+
+# Heatmap
+
+# Load summarized DE object
+se <- readRDS("summarized_de_filter.rds")
+group_df <- colData(se) %>%
+        as.data.frame() %>%
+        rownames_to_column("sample") %>%
+        select(sample, group)
+
+plot_gsea_heatmap <- function(go_term_id, label, n_top_genes = NULL) {
+    # Extract core genes from GSEA result
+    core_genes <- gsea_result@result %>%
+        filter(ID == go_term_id) %>%
+        pull(core_enrichment) %>%
+        str_split("/", simplify = TRUE) %>%
+        as.vector() %>%
+        unique()
+    
+    # Get expression matrix
+    expr_z <- assay(se, "counts") |>
+        edgeR::cpm(log = TRUE, prior.count = 1) |>
+        {\(x) x[intersect(core_genes, rownames(x)), , drop = FALSE]}() |>
+        {\(x) t(scale(t(x)))}()
+    
+    # Subset to top N genes by variance if requested
+    if (!is.null(n_top_genes)) {
+        top_genes <- expr_z %>%
+        apply(1, var) %>%
+        sort(decreasing = TRUE) %>%
+        head(n_top_genes) %>%
+        names()
+        expr_z <- expr_z[top_genes, , drop = FALSE]
+    }
+
+    # Prepare long-format dataframe
+    plot_df <- as.data.frame(expr_z) %>%
+        rownames_to_column("gene") %>%
+        pivot_longer(-gene, names_to = "sample", values_to = "zscore") %>%
+        left_join(group_df, by = "sample")
+
+    # Cluster genes and samples
+    gene_order <- hclust(dist(expr_z))$order
+    plot_df$gene <- factor(plot_df$gene, levels = rownames(expr_z)[gene_order])
+    
+    sample_order <- hclust(dist(t(expr_z)))$order
+    plot_df$sample <- factor(plot_df$sample, levels = colnames(expr_z)[sample_order])
+    
+    # Heatmap
+    p1 <- ggplot(plot_df, aes(x = sample, y = gene, fill = zscore)) +
+        geom_tile(color = "grey90") +
+        scale_fill_viridis_c(option = "D", name = "Z-score") +
+        #scale_fill_viridis_c(option = "D", name = "Z-score", limits = c(-2, 2), oob = scales::squish) +
+        facet_grid(~group, scales = "free_x", space = "free_x",
+                labeller = as_labeller(c(Um = "Uncomplicated", Sm = "Severe"))) +
+        theme(
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12)
+        ) +
+        ylab("Core Genes in Response to Heat") +
+        xlab("Samples")
+
+    # Boxplot (distribution of z-scores by group)
+    p2 <- ggplot(plot_df, aes(x = group, y = zscore, fill = group)) +
+        geom_boxplot(outlier.size = 0.5, width = 0.5) +
+        scale_fill_viridis_d(option = "D") +
+        ylab("Z-score") +
+        xlab(NULL) +
+        theme(legend.position = "none")
+
+    # Save plots
+    ggsave(paste0("gsea_plots/heatmap_", label, ".png"), plot = p1, width = 12, height = 8, dpi = 300)
+    ggsave(paste0("gsea_plots/boxplot_", label, ".png"), plot = p2, width = 5, height = 6, dpi = 300)
+}
+
+
+# Top 15
+plot_gsea_heatmap("GO:0006412", "translation", n_top_genes = 15)
+plot_gsea_heatmap("GO:0006364", "rRNA_processing", n_top_genes = 15)
+
+# Interesting GO terms
+plot_gsea_heatmap("GO:0009408", "response_to_heat", n_top_genes = 15)
+plot_gsea_heatmap("GO:0006400", "tRNA_modification", n_top_genes = 15)
+plot_gsea_heatmap("GO:0004672", "protein_kinase_activity", n_top_genes = 15)
+plot_gsea_heatmap("GO:0016192", "vesicle-mediated_transport", n_top_genes = 15)
+plot_gsea_heatmap("GO:0015031", "protein_transport", n_top_genes = 15)
+
+plot_gsea_heatmap("GO:0060271", "apoptotic_proces_UM", n_top_genes = 15)
+plot_gsea_heatmap("GO:0006915", "cilium assembly_UM", n_top_genes = 15)
+
+# Heatmap based on mean of core genes in enriched GO terms
+plot_gsea_summary_heatmap <- function(go_term_ids,
+                                        label = "summary",
+                                        n_top_genes = NULL,
+                                        use_median = FALSE,
+                                        dotplot_order_df = NULL) {
+    # Z-score expression matrix
+    expr_z <- assay(se, "counts") |>
+        edgeR::cpm(log = TRUE, prior.count = 1) |>
+        {\(x) t(scale(t(x)))}()
+
+    # Extract metadata
+    go_meta <- gsea_result@result %>%
+        filter(ID %in% go_term_ids) %>%
+        select(ID, Description, namespace) %>%
+        distinct() %>%
+        mutate(
+        Description = str_replace_all(Description, "\\s+", " "),
+        Description = str_replace_all(Description, "\u00a0", " ")
+        )
+
+    # Combine gene-level Z-scores
+    summary_df <- purrr::map_dfr(go_term_ids, function(go_id) {
+        core_genes <- gsea_result@result %>%
+        filter(ID == go_id) %>%
+        pull(core_enrichment) %>%
+        str_split("/", simplify = TRUE) %>%
+        as.vector() %>%
+        unique()
+
+        expr_sub <- expr_z[intersect(core_genes, rownames(expr_z)), , drop = FALSE]
+
+        if (!is.null(n_top_genes)) {
+        top_genes <- apply(expr_sub, 1, var) %>%
+            sort(decreasing = TRUE) %>%
+            head(n_top_genes) %>%
+            names()
+        expr_sub <- expr_sub[top_genes, , drop = FALSE]
+        }
+
+        as.data.frame(expr_sub) %>%
+        rownames_to_column("gene") %>%
+        pivot_longer(-gene, names_to = "sample", values_to = "zscore") %>%
+        left_join(group_df, by = "sample") %>%
+        mutate(go_id = go_id)
+    }) %>%
+        left_join(go_meta, by = c("go_id" = "ID"))
+
+    # Summarize by GO × group
+    summary_stat <- summary_df %>%
+        group_by(Description, group, namespace) %>%
+        summarise(
+        zscore = if (use_median) median(zscore, na.rm = TRUE) else mean(zscore, na.rm = TRUE),
+        .groups = "drop"
+        ) %>%
+        mutate(group = factor(group, levels = c("Sm", "Um")))
+
+    # Optional reordering using external dotplot order
+    if (!is.null(dotplot_order_df)) {
+        dotplot_order <- dotplot_order_df %>%
+        filter(GO_term %in% go_term_ids) %>%
+        arrange(GeneRatio) %>%
+        distinct(Description, .keep_all = TRUE)
+        
+        summary_stat <- summary_stat %>%
+        mutate(Description = factor(Description, levels = dotplot_order$Description))
+    } else {
+        summary_stat <- summary_stat %>%
+        mutate(Description = fct_reorder(Description, zscore))
+    }
+
+    # Plot
+    p <- ggplot(summary_stat, aes(x = group, y = Description, fill = zscore)) +
+        geom_tile(color = "grey90") +
+        scale_fill_viridis_c(option = "D", name = "Z-score") +
+        scale_x_discrete(labels = c(Sm = "Severe", Um = "Uncomplicated")) +
+        facet_grid(namespace ~ ., scales = "free_y", space = "free") +
+        theme(
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 13, face = "bold"),
+        panel.spacing = unit(1, "lines")
+        ) +
+        xlab("Group") +
+        ylab("GO Term")
+
+    ggsave(
+        filename = paste0("gsea_plots/summary_heatmap_", label, ".png"),
+        plot = p,
+        width = 10, height = 12, dpi = 300
+    )
+}
+
+## Interesting GO terms
+go_ids <- read_tsv("gsea_plots/gsea_summary_interest.tsv") %>%
+    dplyr::select(GO_term) %>%
+    pull() 
+
+dotplot_order_df <- read_tsv("gsea_plots/gsea_summary_interest.tsv", show_col_types = FALSE)
+
+plot_gsea_summary_heatmap(
+    go_term_ids = go_ids,
+    label = "interesting_terms",
+    n_top_genes = 50,
+    dotplot_order_df = dotplot_order_df
+)
+
+## Top 15 terms for dotplot
+# Load the summary table
+top30_df <- read_tsv("gsea_plots/gsea_summary_top30.tsv", show_col_types = FALSE)
+
+# Get top 15 GO terms per namespace by GeneRatio (to match dotplot default)
+top_dotplot_terms <- top30_df %>%
+    mutate(.sign = ifelse(NES > 0, "positive", "negative")) %>%
+    filter(p.adjust < 0.05) %>%
+    filter(!is.na(namespace) & Description != "glutamatergic synapse" & Description != "chromatin" & namespace != "molecular function") %>%
+    group_by(namespace) %>%
+    slice_min(order_by = p.adjust, n = 15) %>%
+    slice_min(order_by = GeneRatio, n = 15) %>%
+    ungroup() %>%
+    arrange(desc(GeneRatio))
+
+mol_func <- read_tsv("gsea_plots/gsea_summary_top30.tsv", show_col_types = FALSE) %>%
+    filter(Description == "methyltransferase activity" | 
+           Description == "promoter-specific chromatin binding" | 
+           Description == "structural constituent of ribosome" | 
+           Description == "translation initiation factor activity" |
+           Description == "RNA helicase activity" |
+           Description == "helicase activity" |
+           Description == "hydrolase activity" |
+           Description == "nucleic acid binding" |
+           Description == "GTP binding" |
+           Description == "RNA polymerase II transcription regulatory region sequence-specific DNA binding" |
+           Description == "catalytic activity" |
+           Description == "chromatin binding" |
+           Description == "protein kinase binding" |
+           Description == "DNA-binding transcription factor activity, RNA polymerase II-specific" |
+           Description == "cadherin binding") %>%
+    arrange(desc(GeneRatio)) %>%
+    mutate(.sign = ifelse(NES > 0, "positive", "negative")) 
+
+top_dotplot_terms <- top_dotplot_terms %>%
+    rbind(mol_func)
+
+# Step 2: order those by GeneRatio within each facet group
+dotplot_order_df <- top_dotplot_terms %>%
+  arrange(desc(GeneRatio), desc(Description)) %>%
+  select(GO_term, Description, GeneRatio) %>%
+  distinct(Description, .keep_all = TRUE)
+
+go_ids <- dotplot_order_df$GO_term
+
+# Plot summary heatmap with ordering consistent with dotplot
+plot_gsea_summary_heatmap(
+  go_term_ids = go_ids,
+  label = "top_15",
+  n_top_genes = 50,
+  dotplot_order_df = dotplot_order_df
+)
+```

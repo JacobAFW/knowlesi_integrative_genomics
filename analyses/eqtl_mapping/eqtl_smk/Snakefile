@@ -1,0 +1,75 @@
+####################################### Snakefile #########################################
+
+# Load config
+configfile: "config/config.yaml"
+eqtl_dir = config["eqtl_dir"]
+
+# Dynamically extract gene list from expression matrix in eqtl_dir
+import pandas as pd
+genes = pd.read_csv(eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv", sep="\t", nrows=0).columns[2:].tolist()
+
+# Final outputs
+rule all:
+	input:
+		expand("{eqtl_dir}results/eqtl_results/sig_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/suggestive_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir)
+
+# Rule to generate Manhattan, QQ plots and stats for transcripts with hits
+rule plot_fastlmm:
+	input:
+		result = eqtl_dir + "results/eqtl_results/{gene}.tsv",
+		bim = eqtl_dir + "cleaned_overlap.bim"
+	output:
+		sig = eqtl_dir + "results/eqtl_results/sig_snps_{gene}.txt",
+		suggestive = eqtl_dir + "results/eqtl_results/suggestive_snps_{gene}.txt"
+	resources:
+		jobname = lambda wildcards: f"smk-plot-{wildcards.gene}",
+		ncpus = 2,
+		mem = "16GB",
+		walltime = "4:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		"""
+		Rscript scripts/plot_fastlmm_results.R {input.result} {input.bim} cis 10
+		"""
+
+# Main rule to run one eQTL model per gene
+rule run_fastlmm:
+	input:
+		expr = eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv",
+		covar = eqtl_dir + "fastlmm_joint_covariates.tsv",
+		bim = eqtl_dir + "cleaned_overlap.bim",
+		fam = eqtl_dir + "cleaned_overlap.fam",
+		bed = eqtl_dir + "cleaned_overlap.bed",
+		ld_bed = eqtl_dir + "cleaned_overlap_ld.bed"
+	output:
+		result = temp(eqtl_dir + "results/eqtl_results/{gene}.tsv")
+	params:
+		gene = "{gene}",
+		eqtl_dir = eqtl_dir
+	resources:
+		jobname = lambda wildcards: f"smk-fastlmm-{wildcards.gene}",
+		ncpus = 5,
+		mem = "40GB",
+		walltime = "4:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		"""
+		python scripts/run_fastlmm.py \
+			--pheno-gene {params.gene} \
+			--expr-matrix {input.expr} \
+			--ld-bed-covar {input.ld_bed} \
+			--covar {input.covar} \
+			--plink-prefix {params.eqtl_dir}cleaned_overlap \
+			--out {output.result}
+		"""

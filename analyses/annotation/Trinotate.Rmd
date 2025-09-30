@@ -1,0 +1,390 @@
+# Trinotate
+
+# Installations
+
+signalp6 and tmhmm were already downloaded (license required). 
+Set up file paths in trinotate/etc/bashrc.d/95-additional_paths.
+Running older python for compatibility with signalp6.
+
+```{bash,eval=F}
+cd boxes
+
+"${SHELL}" <(curl -L https://raw.githubusercontent.com/vivaxgen/vvg-box/main/install.sh)
+
+source /g/data/pq84/malaria/boxes/trinotate/bin/activate
+cd boxes/bin
+
+micromamba install python=3.10
+cd trinotate/xtools/signalp6_fast/
+pip install signalp-6-package/
+
+git clone --recursive https://github.com/Trinotate/Trinotate.git
+
+micromamba install -c bioconda -c conda-forge -c defaults diamond
+micromamba install -c conda-forge -c bioconda -c defaults sqlite
+micromamba install -c bioconda -c conda-forge -c defaults transdecoder
+micromamba install -c bioconda -c conda-forge -c defaults hmmer
+micromamba install -c bioconda -c conda-forge -c defaults infernal
+micromamba install -c bioconda -c conda-forge -c defaults perl-dbi
+micromamba install -c bioconda -c conda-forge -c defaults perl-dbd-sqlite
+
+echo "Check installations - before checking, activate env again after amending filepaths"
+perl -MDBI -e 'print "DBI is installed\n"'
+command -v diamond
+command -v sqlite3
+command -v TransDecoder.LongOrfs
+command -v hmmscan
+command -v cmsearch
+command -v Trinotate
+```
+
+# Running
+
+```{bash,eval=F}
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation
+unset PERL5LIB
+unset PERL_LOCAL_LIB_ROOT
+source /g/data/pq84/malaria/boxes/trinotate/bin/activate
+```
+
+
+# Set up databases
+
+```{bash,eval=F}
+Trinotate --create \
+    --db pk_denovo_trans.sqlite \
+    --trinotate_data_dir /g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir 
+
+mkdir diamond
+cd diamond 
+
+Trinotate --create \
+    --db pk_denovo_trans_diamond.sqlite \
+    --trinotate_data_dir /g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir_diamond \
+    --use_diamond
+```
+
+# Two options fo DBs
+export TRINOTATE_DATA_DIR=/g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir_diamond
+export TRINOTATE_DATA_DIR=/g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir
+
+# TransDecoder
+
+**required by trinotate**
+
+```{R,eval=F}
+#!/bin/bash
+#PBS -P pq84
+#PBS -q normalbw
+#PBS -N transdecoder
+#PBS -j oe
+#PBS -m ae
+#PBS -l walltime=48:00:00,mem=80GB,ncpus=10
+#PBS -l storage=gdata/pq84+scratch/pq84
+#PBS -M jacob.westaway@menzies.edu.au
+
+echo "---------------------------------------"
+echo "PBS: Job identifier is $PBS_JOBID"
+echo "PBS: Job name is $PBS_JOBNAME"
+
+echo "---------------------------------------"
+echo "Source env modules and paths"
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation
+mkdir transdecoder
+unset PERL5LIB
+unset PERL_LOCAL_LIB_ROOT
+source /g/data/pq84/malaria/boxes/trinotate/bin/activate
+assembly_path="/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/trinity_assembly"
+
+echo "---------------------------------------"
+echo "Start transdecoder - longorfs"
+TransDecoder.LongOrfs -t $assembly_path/trinity_assembly_unique.Trinity.fasta \
+    --gene_trans_map $assembly_path/trinity_assembly_unique.Trinity.fasta.gene_trans_map \
+    --output_dir transdecoder \
+    -m 100
+
+echo "---------------------------------------"
+echo "Start transdecoder - predict" 
+TransDecoder.Predict -t $assembly_path/trinity_assembly_unique.Trinity.fasta  \
+    --single_best_only \
+    --output_dir transdecoder 
+
+echo "---------------------------------------"
+echo "Finished"
+```
+
+# Initialize Trinotate sqlite database with sequence data
+
+```{bash,eval=F}
+assembly_path="/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/trinity_assembly"
+
+Trinotate --db /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/pk_denovo_trans.sqlite \
+    --init \
+    --gene_trans_map $assembly_path/trinity_assembly_unique.Trinity.fasta.gene_trans_map \
+    --transcript_fasta $assembly_path/trinity_assembly_unique.Trinity.fasta \
+    --transdecoder_pep /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/transdecoder/trinity_assembly_unique.Trinity.fasta.transdecoder.pep
+
+cd diamond 
+
+Trinotate --db /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond/pk_denovo_trans_diamond.sqlite \
+    --init \
+    --gene_trans_map $assembly_path/trinity_assembly_unique.Trinity.fasta.gene_trans_map \
+    --transcript_fasta $assembly_path/trinity_assembly_unique.Trinity.fasta \
+    --transdecoder_pep /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/transdecoder/trinity_assembly_unique.Trinity.fasta.transdecoder.pep
+```
+
+# Running Sequence Analyses
+
+## Subset Rfam.cm DB to only include the Rfam families of interest - efficiency
+
+
+cd /g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir_diamond/
+
+cp Rfam.cm Rfam.cm.full_backup
+cp Rfam.clanin Rfam.clanin.full_backup
+
+bash /g/data/pq84/malaria/Pk_trancsriptomics/scripts/subset_rfam_script.sh 
+
+mv reduced_rfam/Rfam_reduced.cm Rfam.cm
+
+### bash script 
+
+```{R,eval=F}
+#!/bin/bash
+
+# Path to your full Rfam.cm
+full_rfam_cm="Rfam.cm"
+
+# Where you want to save the reduced version
+mkdir -p reduced_rfam
+reduced_rfam_cm="reduced_rfam/Rfam_reduced.cm"
+
+# Define a list of important RNA families
+important_families=(
+    5S_rRNA
+    16S_rRNA
+    18S_rRNA
+    23S_rRNA
+    28S_rRNA
+    tRNA
+    miRNA
+    snRNA
+    snoRNA
+)
+
+# Now create a small grep pattern (joined with OR)
+pattern=$(printf "%s|" "${important_families[@]}")
+pattern="${pattern::-1}"  # Remove final trailing |
+
+# Extract
+awk -v pat="$pattern" '
+/^NAME/ {
+    keep=0
+    if ($2 ~ pat) {
+        keep=1
+    }
+}
+keep { print }
+/^\/\// { keep=0 }
+' "$full_rfam_cm" > "$reduced_rfam_cm"
+
+echo "✅ Done. Reduced CM database written to $reduced_rfam_cm"
+
+```
+
+
+# Run Trinity without infernal
+
+**infernal is very slow and so we need to run a reduced version in parrallel to handle our 4M trancsripts**
+
+```{R,eval=F}
+#!/bin/bash
+#PBS -P pq84
+#PBS -q normalbw
+#PBS -N trinotate
+#PBS -j oe
+#PBS -m ae
+#PBS -l walltime=48:00:00,mem=32GB,ncpus=12
+#PBS -l storage=gdata/pq84+scratch/pq84
+#PBS -M jacob.westaway@menzies.edu.au
+
+echo "---------------------------------------"
+echo "PBS: Job identifier is $PBS_JOBID"
+echo "PBS: Job name is $PBS_JOBNAME"
+
+echo "---------------------------------------"
+echo "Source env modules and paths"
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond
+unset PERL5LIB
+unset PERL_LOCAL_LIB_ROOT
+source /g/data/pq84/malaria/boxes/trinotate/bin/activate
+assembly_path="/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/trinity_assembly"
+
+echo "---------------------------------------"
+echo "run trinotate"
+
+Trinotate --db pk_denovo_trans_diamond.sqlite \
+    --CPU 12 \
+    --transcript_fasta $assembly_path/trinity_assembly_unique.Trinity.fasta \
+    --transdecoder_pep /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/transdecoder/trinity_assembly_unique.Trinity.fasta.transdecoder.pep \
+    --trinotate_data_dir /g/data/pq84/malaria/boxes/trinotate/trinotate_data_dir_diamond \
+    --run "swissprot_blastp swissprot_blastx pfam signalp6 tmhmmv2" \
+    --use_diamond 
+
+echo "---------------------------------------"
+echo "Finished"
+
+```
+
+# Run infernal separately in parallel on Ada
+
+## Subset assembly
+
+```{bash,eval=F}
+# Input and base output paths
+FASTA="trinity_assembly_unique.Trinity.fasta"
+CHUNKS=40
+CHUNK_BASE="cmscan_chunks"
+
+# Create base output dir
+mkdir -p "$CHUNK_BASE"
+
+# Split fasta into chunk files
+seqkit split -p $CHUNKS "$FASTA" -O "$CHUNK_BASE"/raw_chunks
+
+# Move each chunk to its own subdirectory
+cd "$CHUNK_BASE"
+for f in raw_chunks/*.fasta; do
+    # Extract just the base filename (e.g., part_001)
+    base=$(basename "$f" .fasta)
+    mkdir -p "$base"
+    mv "$f" "$base/${base}.fasta"
+done
+
+# Optional: remove original raw_chunks dir if empty
+rmdir raw_chunks 2>/dev/null
+
+echo "Done. Each chunk is in its own directory under $CHUNK_BASE/"
+```
+
+## Template slurm script
+
+```{R,eval=F}
+#!/bin/bash
+#SBATCH --job-name=cmscan_part_{CHUNK_ID}
+#SBATCH --output=trinity_assembly_unique.Trinity.part_{CHUNK_ID}/cmscan_part_{CHUNK_ID}.out
+#SBATCH --error=trinity_assembly_unique.Trinity.part_{CHUNK_ID}/cmscan_part_{CHUNK_ID}.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=jacob.westaway@menzies.edu.au
+#SBATCH --time=48:00:00
+#SBATCH --mem=32GB
+#SBATCH --cpus-per-task=12
+#SBATCH --nodes=1
+
+echo "---------------------------------------"
+echo "SLURM: Job identifier is $SLURM_JOB_ID"
+echo "SLURM: Job name is $SLURM_JOB_NAME"
+
+echo "---------------------------------------"
+echo "Activating Infernal environment"
+source /home/jwestaway/projects/pk_transcriptomics/infernal/infernal_box/bin/activate
+
+cd /home/jwestaway/projects/pk_transcriptomics/infernal/outputs/cmscan_chunks/trinity_assembly_unique.Trinity.part_{CHUNK_ID}
+
+echo "Running cmscan for chunk {CHUNK_ID}"
+cmscan --cut_ga --rfam --nohmmonly \
+  --tblout infernal_part_{CHUNK_ID}.out \
+  --fmt 2 --cpu 12 \
+  --clanin /home/jwestaway/projects/pk_transcriptomics/infernal/outputs/Rfam/Rfam.clanin \
+  /home/jwestaway/projects/pk_transcriptomics/infernal/outputs/Rfam/Rfam.cm \
+  trinity_assembly_unique.Trinity.part_{CHUNK_ID}.fasta \
+  > infernal_part_{CHUNK_ID}.log
+
+echo "---------------------------------------"
+echo "cmscan complete for chunk {CHUNK_ID}"
+```
+
+## Generate slurm scripts & submit
+
+```{bash,eval=F}
+TEMPLATE="cmscan_template.slurm"
+OUTDIR="/home/jwestaway/projects/pk_transcriptomics/infernal/outputs/cmscan_chunks"
+
+for i in {001..040}; do
+    sed "s/{CHUNK_ID}/$i/g" "$TEMPLATE" > "cmscan_chunk_${i}.slurm"
+done
+
+for i in $(seq -w 21 40); do
+    script="/home/jwestaway/projects/pk_transcriptomics/infernal/scripts/cmscan_chunk_0${i}.slurm"
+    echo "Submitting chunk ${i}..."
+    sbatch "$script"
+done
+
+```
+
+## Combine and load outputs and load into sqlite, and then generate report
+
+**Ada**
+
+```{bash,eval=F}
+cd /home/jwestaway/projects/pk_transcriptomics/infernal/outputs/cmscan_chunks
+
+echo "List all part files (adjust path if needed)""
+parts=$(find . -type f -name "infernal_part_*.out" | sort)
+
+echo "Extract header (first 2 lines) from the first file"
+head -n 2 trinity_assembly_unique.Trinity.part_001/infernal_part_001.out > infernal_combined.out
+
+echo "Append all content from all files, skipping the first 2 lines of each"
+for f in $parts; do
+  tail -n +3 "$f" >> infernal_combined.out
+done
+
+scp jwestaway@ada.cdu.edu.au:/home/jwestaway/projects/pk_transcriptomics/infernal/outputs/cmscan_chunks/infernal_combined.out jw1542@gadi.nci.org.au:/g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond/
+```
+
+
+**Gadi**
+
+```{bash,eval=F}
+Trinotate --db pk_denovo_trans_diamond.sqlite \
+  --LOAD_infernal infernal_combined.out
+
+Trinotate --db pk_denovo_trans_diamond.sqlite --report > trinity_assembly_unique_non_cod.Trinotate.tsv
+```
+
+# Add transcript length column to report
+
+```{R,eval=F}
+library(tidyverse)
+
+# Paths
+trinotate_path <- "diamond/trinity_assembly_unique_non_cod.Trinotate.tsv"
+pep_path <- "transdecoder/trinity_assembly_unique.Trinity.fasta.transdecoder.pep"
+
+# Step 1: Parse peptide headers to get ORF type
+pep_headers <- read_lines(pep_path) %>%
+    keep(~ str_starts(.x, ">")) %>%
+    str_remove("^>") %>%
+    tibble(header = .) %>%
+    separate_wider_delim(header, delim = " ", names = c("transcript_id", "meta"), too_many = "merge") %>%
+    mutate(
+        full_length = str_detect(meta, "type:complete")
+    ) %>%
+    select(transcript_id, full_length) %>%
+    mutate(transcript_id = str_remove(transcript_id, ".p1"))
+
+# Step 2: Read in Trinotate report
+trinotate <- read_tsv(trinotate_path, na = c("", ".")) %>%
+    rename(transcript_id = `transcript_id`)
+
+# Step 3: Add full_length column
+trinotate_annotated <- trinotate %>%
+    left_join(
+        pep_headers, 
+        by = "transcript_id") %>%
+    mutate(full_length = replace_na(full_length, FALSE))  # mark missing ones as FALSE
+
+# Step 4: Save updated report
+write_tsv(trinotate_annotated, "trinity_assembly_unique_non_cod.Trinotate.with_full_length.tsv")
+```

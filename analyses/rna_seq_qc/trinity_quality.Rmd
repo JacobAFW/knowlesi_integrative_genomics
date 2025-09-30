@@ -1,0 +1,526 @@
+# Set up environment
+
+```{bash,eval=F}
+start_pbs_big_boy
+cd /g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans
+source /g/data/pq84/malaria/Pk_trancsriptomics/smk_rna_denovo_assmebly/activate_pipeline_env.sh
+cd output/trinity_assembly/trans_abundance/TMM-normalised
+```
+
+# Distributions and counts
+
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/Trinity-Transcript-Quantification
+
+## Counting Numbers of Expressed Transcripts or Genes - Trinity
+
+```{R,eval=F}
+data <- read.table("trinity.gene.TPM.not_cross_norm.counts_by_min_TPM", header = T)
+png("genes_plot.png", width = 800, height = 600)
+plot(data, xlim = c(-100,0), ylim = c(0,100000), t = 'b')
+```
+
+## Custom summaries and PCA based on count matrix
+
+```{R,eval=F}
+library(tidyverse)
+library(edgeR)
+library(DESeq2)
+
+count_matrix <- read.table("trinity.gene.counts.matrix", header = T)
+count_matrix <- count_matrix %>%
+    mutate(across(everything(), round)) %>%
+    mutate(RowSum = rowSums(.)) %>%
+    mutate(NumColsGTZero = rowSums(. > 0)) 
+summary(count_matrix$RowSum)
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#       0         0         0       472         5 100793286 
+
+export_plot <- count_matrix %>% 
+    ggplot(aes(x = NumColsGTZero)) +
+    geom_histogram() +
+    labs(x = "Samples with counts > 0",
+         y = "Frequency (contigs)")
+
+ggsave("hist_count_matrix.png", plot = export_plot, dpi = 300, width = 10)
+# Few contigs have counts > 0 in all samples
+
+# PCA - raw counts
+count_matrix <- read.table("trinity.gene.counts.matrix", header = T)
+count_matrix <- count_matrix %>%
+    mutate(across(everything(), round)) %>%
+    mutate(RowSum = rowSums(.)) %>%
+    mutate(NumColsGTZero = rowSums(. > 0)) 
+
+sample_info <- read_table("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/sample_list_trinity_de.txt", col_names = c("condition", "sample")) %>%
+    mutate(sample = str_replace(sample, "-", "."))
+
+count_matrix_subset <- count_matrix %>%
+    filter(RowSum > 0) %>% 
+    #select(-c("PK_SB_RNA_148_DKDL240033647.1A_22NGJ5LT3_L8", "PK_SB_RNA_196_DKDL240033875.1A_22T7H5LT3_L6", 
+   #     "PK_SB_RNA_243_DKDL240033994.1A_22T73NLT3_L8", "PK_SB_RNA_244_DKDL240033995.1A_22T73NLT3_L8")) %>% # controls
+    select(-c(RowSum, NumColsGTZero)) 
+
+count_matrix_subset <- count_matrix_subset %>%
+    t() %>% 
+    as.data.frame() 
+
+# Normalize the data (e.g., log transformation)
+data_log <- log2(count_matrix_subset + 1)
+
+# Perform PCA
+pca_result <- prcomp(data_log, center = TRUE, scale. = TRUE)
+
+pca_scores <- as.data.frame(pca_result$x) %>%
+    rownames_to_column("sample") %>%
+    select(1:3) %>%
+    left_join(
+        sample_info
+    )
+    
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_result)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_result)$importance[2, 2] * 100, 2), "% variance")) +
+    scale_color_manual(values = c("Sm" = "#440154FF", "Um" = "#55C667FF", "Control" = "red")) 
+
+ggsave("pca_log_counts.png", plot = export_plot, dpi = 300)
+
+# PCA - using DESeq2
+library(DESeq2)
+count_matrix <- read.table("trinity.gene.counts.matrix", header = T, row.names = 1)
+sample_info <- read_table("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/sample_list_trinity_de.txt", col_names = c("condition", "sample")) %>%
+    mutate(sample = str_replace(sample, "-", "."))
+
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(count_matrix)), colData = sample_info, design = ~ condition)
+
+# Apply Variance Stabilizing Transformation (VST) - Recommended for PCA
+vsd <- vst(dds, blind=TRUE)
+
+# Perform PCA
+pca_data <- prcomp(t(assay(vsd)))
+
+# Create a data frame with PCA results
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = rownames(pca_data$x))
+
+pca_scores <- pca_df %>%
+    left_join(
+        sample_info
+    )
+
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+    scale_color_manual(values = c("Sm" = "#440154FF", "Um" = "#55C667FF", "Control" = "red")) 
+
+ggsave("pca_deseq_counts.png", plot = export_plot, dpi = 300)
+
+# PCA with clusters
+
+library(readxl)
+
+linkage_meta <- read_xlsx("/g/data/pq84/malaria/Pk_trancsriptomics/data/batch2/PK_Sabah_Samples.xlsx") %>%
+    mutate(sampleid = str_replace(sampleid, "D", "R")) %>%
+    mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+        ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+        .$subjectid))) %>%
+    mutate(studyid = paste(group, subjectid, sep = "")) %>%
+    select(sampleid, severe, studyid) %>%
+    rbind(
+        read_xlsx("/g/data/pq84/malaria/Pk_trancsriptomics/data/batch2/pk_sb_rna_set2_samplecodes.xlsx") %>%
+            dplyr::rename(sampleid = sample.name, severe = severity, studyid = sample.id, parasitemia = par) %>%
+            select(sampleid, severe, studyid)
+    ) 
+
+cluster_data <- read.table("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/Population_genetics/sample_clusters.txt") %>%
+            select(-V2) %>% 
+            dplyr::rename(sample = V1, cluster = V3) %>%
+            mutate(studyid = str_remove(sample, "_DK.*|_HALF")) %>%
+            mutate(studyid = str_replace(studyid, "D", "R"))
+
+cluster_meta <- linkage_meta %>%
+    filter(studyid %in% cluster_data$studyid) %>%
+    left_join(
+        cluster_data 
+    ) %>%
+    rbind(
+        linkage_meta %>% 
+            filter(!(studyid %in% cluster_data$studyid)) %>%
+            filter(sampleid %in% cluster_data$studyid) %>%
+            mutate(studyid = sampleid) %>%
+            left_join(cluster_data)
+    ) %>%
+    select(sampleid, cluster) %>%
+    dplyr::rename(sample = sampleid)
+
+pca_scores_cluster <- pca_scores %>% 
+    mutate(sample = str_remove(sample, "_DK.*|_HALF.*")) %>% 
+    mutate(sample = str_remove(sample, "ZS_")) %>%
+    left_join(
+        cluster_meta
+    ) %>% 
+    na.omit() 
+
+export_plot <- ggplot(pca_scores_cluster, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = cluster)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+    scale_color_manual(values = c("Mf" = "#440154FF", "Mn" = "#55C667FF", "Control" = "red")) 
+
+ggsave("pca_deseq_counts_cluster.png", plot = export_plot, dpi = 300)
+
+
+##########################################
+# Filtering and re-plotting PCA
+
+## Filtering by prevelance and raw counts
+filtered_matrix <- read_delim("trinity.gene.counts.matrix", delim = "\t") %>%
+  column_to_rownames(var = names(.)[1]) %>%
+  rownames_to_column(var = "transcript_id") %>%
+  mutate(nonzero_count = rowSums(across(-transcript_id, ~ . > 0))) %>%
+  filter(nonzero_count >= ceiling(0.7 * (ncol(.) - 2))) %>%  # -2 to exclude transcript_id and nonzero_count
+  select(-nonzero_count) %>%
+  column_to_rownames(var = "transcript_id") %>%
+  round()
+
+# Calculate mean expression for each transcript across samples
+transcript_means <- filtered_matrix %>%
+    rownames_to_column("transcript_id") %>%
+    mutate(mean_expr = rowMeans(across(-transcript_id))) 
+
+# Plot histogram
+export_plot <- ggplot(transcript_means, aes(x = mean_expr)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of Transcript Expression (mean per transcript)",
+    x = "Mean Expression (log10 scale)",
+    y = "Number of Transcripts"
+  )
+
+ggsave("hist_transcript_dist_filtered.png", plot = export_plot, dpi = 300)
+
+# Define expression cutoffs (e.g., remove bottom 5% and top 1%)
+lower_cutoff <- quantile(transcript_means$mean_expr, 0.05)
+upper_cutoff <- quantile(transcript_means$mean_expr, 0.99)
+
+# Filter the matrix
+filtered_matrix_no_outliers <- filtered_matrix %>%
+  rownames_to_column("transcript_id") %>%
+  left_join(transcript_means %>% select(transcript_id, mean_expr), by = "transcript_id") %>%
+  filter(mean_expr > lower_cutoff, mean_expr < upper_cutoff) %>%
+  select(-mean_expr) %>%
+  column_to_rownames("transcript_id")
+
+# Re-plot histogram of the filtered transcripts
+transcript_means_filtered <- filtered_matrix_no_outliers %>%
+  rownames_to_column("transcript_id") %>%
+  mutate(mean_expr = rowMeans(across(-transcript_id)))
+
+export_plot <- ggplot(transcript_means_filtered, aes(x = mean_expr)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(
+    title = "Filtered Transcript Expression Distribution",
+    x = "Mean Expression (log10 scale)",
+    y = "Number of Transcripts"
+  )
+
+ggsave("hist_transcript_dist_filtered_outliers.png", plot = export_plot, dpi = 300)
+
+# PCA with filtered data
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(filtered_matrix)), colData = sample_info, design = ~ condition)
+
+# Apply Variance Stabilizing Transformation (VST) - Recommended for PCA
+vsd <- vst(dds, blind=TRUE)
+
+# Perform PCA and join with metadata
+pca_data <- prcomp(t(assay(vsd)))
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = rownames(pca_data$x))
+pca_scores <- pca_df %>%
+    left_join(sample_info %>% mutate(sample = str_replace(sample, "\\.", "-")))
+
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+scale_color_manual(values = c("Um" = "#440154FF", "Sm" = "#55C667FF")) 
+
+ggsave("pca_deseq_filtered.png", plot = export_plot, dpi = 300)
+
+
+# PCA with filtered data
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(filtered_matrix_no_outliers)), colData = sample_info, design = ~ condition)
+
+# Apply Variance Stabilizing Transformation (VST) - Recommended for PCA
+vsd <- vst(dds, blind=TRUE)
+
+# Perform PCA and join with metadata
+pca_data <- prcomp(t(assay(vsd)))
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = rownames(pca_data$x))
+pca_scores <- pca_df %>%
+    left_join(sample_info %>% mutate(sample = str_replace(sample, "\\.", "-")))
+
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+scale_color_manual(values = c("Um" = "#440154FF", "Sm" = "#55C667FF")) 
+
+ggsave("pca_deseq_filtered_outliers.png", plot = export_plot, dpi = 300)
+
+
+## Filtering by CPM prevelance and CPM counts
+## 70% of samples have CPM > 1
+filtered_matrix_cpm <- read_delim("trinity.gene.counts.matrix", delim = "\t") %>%
+  column_to_rownames(var = names(.)[1]) %>%
+  { 
+    # Calculate CPM inside the pipeline
+    cpm_mat <- cpm(DGEList(counts = .))
+    min_samples <- ceiling(0.70 * ncol(.))  # 70% of samples
+    # Filter and round counts based on CPM threshold
+    .[rowSums(cpm_mat > 1) >= min_samples, ] 
+  } %>%
+  round()
+
+
+# PCA with filtered data
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(filtered_matrix_cpm)), colData = sample_info, design = ~ condition)
+
+# Apply Variance Stabilizing Transformation (VST) - Recommended for PCA
+vsd <- vst(dds, blind=TRUE)
+
+# Perform PCA and join with metadata
+pca_data <- prcomp(t(assay(vsd)))
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = rownames(pca_data$x))
+pca_scores <- pca_df %>%
+    left_join(sample_info %>% mutate(sample = str_replace(sample, "\\.", "-")))
+
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+scale_color_manual(values = c("Um" = "#440154FF", "Sm" = "#55C667FF")) 
+
+ggsave("pca_deseq_filtered_cpm.png", plot = export_plot, dpi = 300)
+
+## 30% of samples have CPM > 1
+filtered_matrix_cpm <- read_delim("trinity.gene.counts.matrix", delim = "\t") %>%
+  column_to_rownames(var = names(.)[1]) %>%
+  { 
+    # Calculate CPM inside the pipeline
+    cpm_mat <- cpm(DGEList(counts = .))
+    min_samples <- ceiling(0.30 * ncol(.))  # 70% of samples
+    # Filter and round counts based on CPM threshold
+    .[rowSums(cpm_mat > 1) >= min_samples, ] 
+  } %>%
+  round()
+
+
+# PCA with filtered data
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(filtered_matrix_cpm)), colData = sample_info, design = ~ condition)
+
+# Apply Variance Stabilizing Transformation (VST) - Recommended for PCA
+vsd <- vst(dds, blind=TRUE)
+
+# Perform PCA and join with metadata
+pca_data <- prcomp(t(assay(vsd)))
+pca_df <- data.frame(PC1 = pca_data$x[,1], PC2 = pca_data$x[,2], sample = rownames(pca_data$x))
+pca_scores <- pca_df %>%
+    left_join(sample_info %>% mutate(sample = str_replace(sample, "\\.", "-")))
+
+export_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = condition)) +
+  xlab(paste0("PC1: ", round(summary(pca_data)$importance[2, 1] * 100, 2), "% variance")) +
+  ylab(paste0("PC2: ", round(summary(pca_data)$importance[2, 2] * 100, 2), "% variance")) +
+scale_color_manual(values = c("Um" = "#440154FF", "Sm" = "#55C667FF")) 
+
+ggsave("pca_deseq_filtered_cpm_30.png", plot = export_plot, dpi = 300)
+
+
+read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/full_meta_for_de.tsv")
+```
+
+# Contig statistics with Trinity
+
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/There-are-too-many-transcripts!-What-do-I-do%3F
+
+## Contig Nx Statistics - Trinity
+
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/Transcriptome-Contig-Nx-and-ExN50-stats
+Based on the lengths of the assembled transcriptome contigs, we can compute the conventional Nx length statistic, such that at least x% of the assembled transcript nucleotides are found in contigs that are at least of Nx length. 
+The traditional method is computing N50, such that at least half of all assembled bases are in transcript contigs of at least the N50 length value.
+
+```{bash.eval=F}
+cdd 1
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/TrinityStats.pl trinity_assembly_unique.Trinity.fasta
+```
+
+### Output
+################################
+## Counts of transcripts, etc.
+################################
+Total trinity 'genes':  3803567
+Total trinity transcripts:      4716791
+Percent GC: 41.39
+
+########################################
+Stats based on ALL transcript contigs:
+########################################
+
+        Contig N10: 702
+        Contig N20: 448
+        Contig N30: 370
+        Contig N40: 324
+        Contig N50: 290
+
+        Median contig length: 257
+        Average contig: 308.23
+        Total assembled bases: 1453873417
+
+
+#####################################################
+## Stats based on ONLY LONGEST ISOFORM per 'GENE':
+#####################################################
+
+        Contig N10: 578
+        Contig N20: 422
+        Contig N30: 359
+        Contig N40: 318
+        Contig N50: 287
+
+        Median contig length: 258
+        Average contig: 302.43
+        Total assembled bases: 1150320467
+
+### Output of alt assembly - concating all samples together
+################################
+## Counts of transcripts, etc.
+################################
+Total trinity 'genes':  6029238
+Total trinity transcripts:      7451056
+Percent GC: 41.66
+
+########################################
+Stats based on ALL transcript contigs:
+########################################
+
+        Contig N10: 747
+        Contig N20: 559
+        Contig N30: 463
+        Contig N40: 397
+        Contig N50: 347
+
+        Median contig length: 286
+        Average contig: 345.30
+        Total assembled bases: 2572853360
+
+
+#####################################################
+## Stats based on ONLY LONGEST ISOFORM per 'GENE':
+#####################################################
+
+        Contig N10: 718
+        Contig N20: 553
+        Contig N30: 463
+        Contig N40: 399
+        Contig N50: 350
+
+        Median contig length: 290
+        Average contig: 346.11
+        Total assembled bases: 2086786157
+
+## Contig Ex90N50 Statistic and Ex90 Gene Count - Trinity
+
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/Transcriptome-Contig-Nx-and-ExN50-stats
+An alternative to the Contig Nx statistic that could be considered more appropriate for transcriptome assembly data is the ExN50 statistic. 
+Here, the N50 statistic is computed as above but limited to the top most highly expressed genes that represent x% of the total normalized expression data. 
+The gene expression is take as the sum of the transcript isoform expression and the gene length is computed as the expression-weighted mean of isoform lengths. 
+
+```{bash,eval=F}
+echo "transcripts/isoforms"
+
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/contig_ExN50_statistic.pl \
+    trans_abundance/trinity.isoform.TMM.EXPR.matrix trinity_assembly_unique.Trinity.fasta transcript | tee ExN50.transcript.stats
+
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/plot_ExN50_statistic.Rscript  ExN50.transcript.stats  
+
+echo "how many transcripts correspond to the Ex 90 peak"
+
+cat trinity.isoform.TMM.EXPR.matrix.by-transcript.E-inputs |  egrep -v ^\# | awk '$1 <= 90' | wc -l
+
+
+echo "genes"
+
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/contig_ExN50_statistic.pl \
+    trans_abundance/trinity.isoform.TMM.EXPR.matrix trinity_assembly_unique.Trinity.fasta gene | tee ExN50.gene.stats
+
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/plot_ExN50_statistic.Rscript  ExN50.gene.stats 
+
+echo "how many genes correspond to the Ex 90 peak"
+
+cat trinity.isoform.TMM.EXPR.matrix.by-gene.E-inputs |  egrep -v ^\# | awk '$1 <= 90' | wc -l
+
+```
+
+Although the N50 is 287-290 across the entire transcript set, when we consider the top 90% of the most highly expressed transcripts, the Ex90N50 is ~5.5kb. 
+This suggests that the most highly expressed transcripts are longer than the average transcript - higher quality.
+In addition, the Ex90 count is 65634 transcripts, which is a substantial number of transcripts that are highly expressed, but more reasonable than the original 3M.
+Reference point: Trinity example = 2 E90 number of genes (23,471) for which the E90N50 value is computed is just a fraction of the total number of genes (1,554,055) with isoforms assembled and for which the N50 statistic was based.
+
+## Estimating TPM thresholds for transcript counting and filtering
+
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/Transcriptome-Contig-Nx-and-ExN50-stats
+Using the '*.E-inputs' file produced during the contig ExN50 profiling above, you can explore estimating the TPM threshold that would separate substantially expressed transcripts (or genes) from those that are the lowly expressed transcripts. 
+This is done by ordering transcripts (or genes) according to expression value and plotting their ranking (from low to hi) (y-axis) according to their expression (log2 expression) (x-axis), and finding the point that represents the elbow of the curve as a way of partitioning the lowly and more substantially expressed features. 
+
+```{bash,eval=F}
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/try_estimate_TPM_filtering_threshold.Rscript --E_inputs trinity.isoform.TMM.EXPR.matrix.by-gene.E-inputs 
+/g/data/pq84/bin/trinityrnaseq-v2.15.1/util/misc/try_estimate_TPM_filtering_threshold.Rscript --E_inputs trinity.isoform.TMM.EXPR.matrix.by-transcript.E-inputs 
+```
+
+
+Assembly 1
+
+-parsing:trinity.isoform.TMM.EXPR.matrix.by-gene.E-inputs
+-performing elbow analysis to select threshold.
+-Number of transcripts >= tpm threshold: 300048
+-Fraction of expression data represented: 92
+-Contig N50 based on these transcripts: 267
+-selected TPM threshold: 4.494
+
+-parsing:trinity.isoform.TMM.EXPR.matrix.by-transcript.E-inputs
+-performing elbow analysis to select threshold.
+-Number of transcripts >= tpm threshold: 384485
+-Fraction of expression data represented: 90
+-Contig N50 based on these transcripts: 304
+-selected TPM threshold: 4.311
+
+Assembly 2
+
+-parsing:trinity.isoform.TMM.EXPR.matrix.by-gene.E-inputs
+-performing elbow analysis to select threshold.
+-Number of transcripts >= tpm threshold: 386998
+-Fraction of expression data represented: 89
+-Contig N50 based on these transcripts: 258
+-selected TPM threshold: 3.926
+
+-parsing:trinity.isoform.TMM.EXPR.matrix.by-transcript.E-inputs
+-performing elbow analysis to select threshold.
+-Number of transcripts >= tpm threshold: 486017
+-Fraction of expression data represented: 91
+-Contig N50 based on these transcripts: 282
+-selected TPM threshold: 3.777
+
+# Worth noting - from Trinity Wiki
+https://github.com/trinityrnaseq/trinityrnaseq/wiki/There-are-too-many-transcripts!-What-do-I-do%3F
+
+There's really no good reason to immediately filter them out. 
+They can be 'passengers' throughout all of your data analyses, and if any of them are important, they'll ideally surface in the relevant study. 
+You can put them all through Trinotate.github.io for annotation/analysis, and you can put them through DE studies just fine \
+(**those with insufficent reads will get directly filtered out during the DE analysis protocols to avoid problems associated with multiple hypothesis testing**); \
+**If the read counts are few or lacking, they simply won't surface as significant DE entries**, but if there's protein homology or other interesting features, \
+you'll want to continue to capture this info - hence don't feel the need to immediately filter!
+
+The filtering mentioned above that Trinity has already drops the transcript numbers down to 600K, which is a more reasonable number of transcripts to work with.
+From there, based on what they're saying, we should'nt ge

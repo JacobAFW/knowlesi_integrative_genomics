@@ -1,0 +1,27 @@
+#!/bin/bash
+#PBS -P pq84
+#PBS -q normalbw
+#PBS -N eqtl
+#PBS -j oe
+#PBS -m ae
+#PBS -l walltime=48:00:00,mem=8GB,ncpus=1
+#PBS -l storage=gdata/pq84+scratch/pq84
+#PBS -M jacob.westaway@menzies.edu.au
+
+echo "---------------------------------------"
+echo "PBS: Job identifier is $PBS_JOBID"
+echo "PBS: Job name is $PBS_JOBNAME"
+
+echo "---------------------------------------"
+echo "Source env modules and paths"
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/eqtl/bin/activate
+cd /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk
+
+echo "---------------------------------------"
+echo "Start snakemake pipeline"
+snakemake --profile config/pbs-submission/ --keep-going --latency-wait 10 --snakefile Snakefile
+
+echo "---------------------------------------"
+echo "Pipeline finished"

@@ -1,0 +1,1308 @@
+# Run fastLMM (GWAS) 
+
+```{bash,eval=F}
+start_pbs_big_boy
+module load bcftools/1.12
+module load java/jdk-8.40 
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+export PATH=$PATH:/g/data/pq84/bin/plink2/
+source /g/data/pq84/python-3.9.2/bin/activate
+export PATH=$PATH:/g/data/pq84/bin/admixture_linux-1.3.0/
+
+FASTA="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta"
+VCF="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/04_Variant_calling/filtered/adjusted_filters/include_archived_samples"
+GATK="/g/data/pq84/bin/GenomeAnalysisTK-3.8-1-0/GenomeAnalysisTK.jar"
+REGIONS_TO_MASK="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/regions_to_mask.list"
+
+cd /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/
+```
+
+
+################################################## 
+
+# Strict filters - 5 & 5 & MAF 5 (PCs and batch covariates)
+
+## Set up PLINK inputs
+
+```{bash,eval=F}
+cd /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/
+
+mkdir -p fastlmm_updated_framework/geno_5/MAF_5
+
+plink --bfile Pk --recode --set-hh-missing --out fastlmm_updated_framework/geno_5/cleaned
+plink --file fastlmm_updated_framework/geno_5/cleaned --geno 0.20 --make-bed --out fastlmm_updated_framework/geno_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_5/cleaned --recode --out fastlmm_updated_framework/geno_5/cleaned
+plink --file fastlmm_updated_framework/geno_5/cleaned --mind 0.05 --make-bed --out fastlmm_updated_framework/geno_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_5/cleaned --recode --out fastlmm_updated_framework/geno_5/cleaned
+plink --file fastlmm_updated_framework/geno_5/cleaned --geno 0.05 --make-bed --out fastlmm_updated_framework/geno_5/cleaned
+plink --file fastlmm_updated_framework/geno_5/cleaned --maf 0.05 --make-bed --out fastlmm_updated_framework/geno_5/MAF_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_5/MAF_5/cleaned --pca --out fastlmm_updated_framework/geno_5/MAF_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_5/MAF_5/cleaned --distance square --out fastlmm_updated_framework/geno_5/MAF_5/cleaned
+```
+
+
+## ADMIXTURE analysis to define clusters
+
+```{bash,eval=F}
+cd fastlmm_updated_framework/geno_5/MAF_5/
+admixture --cv cleaned.bed 3 > log.out
+Rscript /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/define_admixture_clusters.R
+```
+
+### ADMIXTURE script above 
+
+```{R,eval=F}
+library(tidyverse)
+
+# Read in wrangel data
+admixture_table <- read.table("cleaned.3.Q") %>%
+    cbind(
+        read.table("cleaned.fam") %>%
+            select(1) %>%
+            rename(Sample = V1)
+    ) %>% 
+    arrange(desc(V3), desc(V2), desc(V1)) %>% 
+    add_column(Sample2 = as.factor(1:nrow(.))) %>%
+    pivot_longer(1:3, 
+        names_to = "Ancestry", 
+        values_to = "Proportion") %>% 
+  mutate(Cluster = ifelse(Ancestry == "V1", "Mf",
+                          ifelse(Ancestry == "V2", "Mn", "Peninsular"))) 
+
+# Clusters as determined by admixture
+admix_clusters <- admixture_table %>% 
+    group_by(Sample) %>% 
+    filter(Proportion == max(Proportion)) 
+
+write_tsv(admix_clusters, "admix_clusters.tsv")
+```
+
+## Metadata
+
+```{R,eval=F}
+# Packages
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(ggExtra)
+library(ape)
+library(ggtree)
+library(viridis)
+
+# Metadata
+metadata <- read_csv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/full_dataset_011223.csv") %>%
+    rename(Sample = studycode) %>% 
+    add_column(Cluster = NA) %>% 
+    mutate(sevemal = ifelse(grepl("Um", sevemal), "Um", 
+        ifelse(sevemal == "1", "Sm",
+        ifelse(sevemal == "0", "Um", .$sevemal)))) %>%
+    mutate(Sample = str_to_upper(Sample)) %>% 
+    unique()
+
+original_metadata <- readxl::read_xlsx("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/PK_Sabah_Sample_naming_indexes.xlsx") %>%
+    select(1:3) %>%
+    mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+        ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+        .$subjectid))) %>%
+    unite(Sample, c("group", "subjectid"), sep ="") %>% 
+    rename(Sample2 = sampleid)
+
+metadata <- metadata %>%
+    left_join(original_metadata) %>%
+    mutate(Sample2 = ifelse(is.na(Sample2), Sample, Sample2)) %>%
+    select(-Sample) %>%
+    rename(Sample = Sample2) %>%
+    relocate(Sample)
+    
+    
+archived_data <- read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_metadata.csv") %>%
+        select(1, 3, 5) %>% 
+        rename(district = area) %>%
+        mutate(Cluster = str_remove(Group, "-Pk")) %>% 
+        select(-Group) %>% 
+        rbind(read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_peninsular_metadata.csv") %>%
+        select(2, 8) %>%
+        rename(Sample = ENA_accession_no_ES) %>%
+        rename(district = Location) %>%
+        add_column(Cluster = "Peninsular")
+        ) %>%
+        add_column(enroldate=NA, age = NA, sex=NA, ethnicity=NA, village=NA, occupation=NA, Hb=NA, platelets=NA,
+        parasitemia=NA, fever=NA, respiratory_rate=NA, oxygen_saturation=NA, systolic_BP=NA, diastolic_BP=NA, G6PD=NA,
+        pregnant=NA, creatinine=NA, study=NA, bicarbonate=NA, PCR=NA, sevemal=NA, bilirubin=NA, glucose=NA, bleeding_severity=NA)
+
+
+metadata <- metadata %>%
+    rbind(archived_data)
+
+# Basic Model
+Plink_fam <- read.table("cleaned.fam", sep =" ") %>% 
+    mutate(Sample = str_remove(V1, "_DK.*")) %>% 
+    mutate(Sample = ifelse(!grepl("PK_SB_DNA", Sample), str_replace(Sample, "_", "-"), Sample)) %>% 
+    left_join(metadata) %>% 
+    select(-Sample) %>%
+    select(1:5, sevemal) %>%
+    mutate(sevemal = ifelse(sevemal == "Sm", 2, 1))
+
+# Duplicate samples 
+dups <- Plink_fam %>% # get original dup name to remove during recoding step
+    group_by(V1) %>%
+    summarise(n = n()) %>%
+    filter(n >= 2) 
+
+Plink_fam <- Plink_fam %>% # give dups different names - otherwise PLINK freaks out
+    filter(V1 != dups$V1) %>% 
+    rbind(
+        Plink_fam %>% 
+            filter(V1 %in% dups$V1) %>%
+            group_by(V1) %>%
+            add_column(temp = 1:nrow(.)) %>%
+            ungroup() %>%
+            mutate(V1 = ifelse(temp > 1, paste0(V1, "_2"), V1)) %>%
+            mutate(V2 = ifelse(temp > 1, paste0(V2, "_2"), V2)) %>%
+            select(-temp)
+    )
+
+# updated fam file
+write.table(Plink_fam, "cleaned.fam", quote = FALSE, sep = " ", col.names = FALSE, row.names = FALSE)
+
+# samples to exclude
+Plink_fam %>% 
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% # samples that cluster alone in PCA
+    unique() %>%
+    write_tsv("samples_to_exclude.tsv", col_names=F)
+
+
+# Covariate models
+## metadata - covariates
+multi_covar <- Plink_fam %>%
+    as_tibble() %>%
+    mutate(batch = ifelse(grepl("PK_SB_DNA_", V1), 1, 2)) %>%
+    left_join(
+        read.table("cleaned.eigenvec") %>%
+        as_tibble() %>%
+        select(V1, PC1 = V3, PC2 = V4, PC3 = V5, PC4 = V6, PC5 = V7),
+        by = "V1"
+    )
+
+multi_covar %>%
+    select(V1, V2, batch, PC1, PC2, PC3, PC4, PC5) %>%
+    filter(!is.na(batch)) %>% 
+    na.omit() %>%
+    write_tsv("multi_column_covar.fam", col_names = F)
+
+## samples to exclude 
+multi_covar %>%
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% 
+    write_tsv("samples_to_exclude_covar.tsv", col_names = F)
+
+# Quick test for association betweens sevemal and parasitemia
+test_set <- read.table("cleaned.fam", sep =" ") %>% 
+    mutate(Sample = str_remove(V1, "_DK.*")) %>% 
+    mutate(Sample = ifelse(!grepl("PK_SB_DNA", Sample), str_replace(Sample, "_", "-"), Sample)) %>% 
+    left_join(metadata) %>% 
+    select(parasitemia, sevemal) %>% 
+    na.omit() %>% 
+    mutate(parasitemia = as.numeric(parasitemia))
+
+out <- wilcox.test(parasitemia ~ sevemal, data = test_set)
+capture.output(out, file = "wilcoxon_parasitemia_vs_severity.txt")
+
+
+# PCA
+
+## Read in data
+pca <- read_table("cleaned.eigenvec", col_names = F) %>%
+    select(-1) %>%
+    rename("sampleid" = "X2") %>%
+    rename_at(vars(starts_with("X")), ~str_replace(., "X.*", paste0("PC", seq_along(.))))
+
+eigenval <- scan("cleaned.eigenval")
+
+pca <- pca %>%
+    rename(Sample = sampleid) %>%
+    mutate(Sample2 = str_remove(Sample, "_DK.*")) %>% # we need the original names downstream for the NJT
+    left_join(
+        metadata %>% 
+            mutate(Sample2 = Sample),
+        by = "Sample2"
+    ) %>%
+    left_join(
+        read_tsv("admix_clusters.tsv") %>% 
+            select(Sample.x = Sample, admix = Cluster),
+        by = "Sample.x"
+    ) %>%
+    filter(!is.na(sevemal)) %>%
+    filter(Sample.x != "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4")# remove problematic sample
+
+## Percentage variance explained by each PC
+pve <- data.frame(PC = 1:20, pve = eigenval/sum(eigenval)*100)
+
+pve_plot <- data.frame(PC = 1:20, pve = eigenval/sum(eigenval)*100) %>%
+    ggplot(aes(PC, pve)) + 
+        geom_bar(stat = "identity") + 
+        ylab("Percentage variance explained") + 
+        theme_light()
+
+ggsave("percentage_variance_explained.png", dpi=300, pve_plot)
+
+
+## PCA - clusters
+pca_plot <- ggplot(pca, aes(PC1, PC2, colour = admix)) + 
+    geom_point(size = 3, alpha = 0.5) +
+    scale_color_manual(
+        values = c("#440154FF", "#39568CFF", "#1F968BFF", "#73D055FF"),
+        name = "ADMIXTURE Cluster"
+    ) +
+    xlab(paste0("PC1 (", signif(pve$pve[1], 3), "%)")) + 
+    ylab(paste0("PC2 (", signif(pve$pve[2], 3), "%)")) +
+    theme(
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14)
+    )
+
+ggsave("pca_cluster.png", dpi = 600, height = 7, width = 7, pca_plot)
+
+
+# Neighbour-joining tree
+
+# Read in data and filter out problematic and public sample
+# Step 1: Read in all sample IDs from .id file
+all_ids <- read_table("cleaned.dist.id", col_names = FALSE) %>%
+  rename(SampleID = X1) %>%
+  mutate(SampleID = make.unique(as.character(SampleID)))  # make sure column names are unique
+
+# Step 2: Read full distance matrix WITHOUT column names
+dist_raw <- read_table("cleaned.dist", col_names = FALSE)
+
+# Step 3: Assign proper column names (after reading)
+colnames(dist_raw) <- all_ids$SampleID
+
+# Step 4: Add row names
+dist_raw <- dist_raw %>%
+  as.data.frame() %>%
+  add_column(Row_Names = all_ids$SampleID) %>%
+  column_to_rownames("Row_Names")
+
+# Step 5: Subset to samples present in PCA metadata
+good_samples <- unique(pca$Sample.x)
+dist_filtered <- dist_raw[rownames(dist_raw) %in% good_samples, colnames(dist_raw) %in% good_samples]
+
+# Step 6: Filter ID metadata as well
+NJT_ID <- all_ids %>% filter(SampleID %in% good_samples)
+
+# Step 7: Final matrix
+NJT_matrix <- as.matrix(dist_filtered)
+
+## Plot tree
+
+#Plot 
+options(ignore.negative.edge=TRUE)
+
+# Clusters
+# Read in metadata and assign colours - based on clusters
+NJT_metadata <- pca %>%
+    mutate(Colour = ifelse(admix == "Mf", "#440154FF", ifelse(admix == "Mn", "#39568CFF", ifelse(admix == "Peninsular", "#1F968BFF", "#808080")))) %>%
+    rename(Sample = Sample.x) 
+
+# Generate NJT and reorder outer to inner edges
+NJT_tree <- nj(NJT_matrix) %>% 
+       reorder.phylo(order = "postorder") 
+
+# Get tip colours by joining metadata and tip labels
+tip_colours <- NJT_tree$tip.label %>% 
+    as.data.frame() %>% 
+    rename(Sample = ".") %>%
+    left_join(
+        NJT_metadata %>% 
+            select(Sample, Colour)
+        ) %>% 
+    select(Colour) %>% 
+    mutate(Colour = ifelse(is.na(Colour), "#808080", .$Colour)) %>%
+    pull()
+
+# Combine tip colours and edge IDs - gives list of colours for each edge, with #### representing missing values (ie internal edges)
+edge_colours <- tip_colours[NJT_tree$edge[, 2]]
+edge_colours[is.na(edge_colours)] <- "####"
+
+# Loop through each edge and assign colours to internal edges dependent on the nodes that branch from it (ie if two nodes/edges of the same colour branch from the same node/edge, then assign that branch with the colour of the two nodes/edges)
+for (edge in 1:nrow(NJT_tree$edge)) {
+    if (edge_colours[edge] == "####") { 
+        nodes <- which(NJT_tree$edge[, 1] == NJT_tree$edge[edge, 2]) # creates object of all the nodes that have multiple branches coming from them
+        if (edge_colours[nodes[1]] == edge_colours[nodes[2]]) { # if the colour of the node in the first column = the second column 
+            edge_colours[edge] <- edge_colours[nodes[1]] # make the edge that they branch from the same colour
+            } else {
+            edge_colours[edge] <- "#808080" # otherwise we make it grey - this object has ALL colours for ALL nodes
+            }
+        }
+    }
+
+NJT_tree_colours <- edge_colours %>% 
+    as.data.frame() %>%
+    cbind(as.data.frame(NJT_tree$edge[, 2])) %>% # joining the resulting colours (for ALL nodes) to the edges data in the original tree - so that when we plot it assigns the correct colour to the correct edge
+    rename(Colour = ".", node = "NJT_tree$edge[, 2]") %>% 
+    relocate(node) # might not be needed...
+
+NJT_tree_plot <- ggtree(NJT_tree, layout = "daylight", size = 0.5) %<+% NJT_tree_colours + 
+    aes(colour = I(Colour)) 
+
+ggsave("njt_tree_cluster_unrooted.png", dpi = 300, NJT_tree_plot)
+```
+
+## Recode for fastLMM 
+
+```{bash,eval=F}
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude.tsv --out fastLMM
+plink --file fastLMM --indep-pairwise 100 5 0.2 --out fastLMM_ld
+plink --bfile fastLMM --recode --make-bed --exclude fastLMM_ld.prune.out --out fastLMM_ld
+cat fastLMM.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_clean.fam
+
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude_covar.tsv --out fastLMM_covar
+plink --file fastLMM_covar --indep-pairwise 100 5 0.2 --out fastLMM_covar_ld
+plink --bfile fastLMM_covar --recode --make-bed --exclude fastLMM_covar_ld.prune.out --out fastLMM_covar_ld
+cat fastLMM_covar.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_covar_clean.fam
+
+python3 /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/fastlmm_updated_2.0.py
+Rscript /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/gwas_plots_updated_2.0.R
+
+rm -f cleaned* fast* cluster* plink*
+```
+
+# Script to run fastLMM in python (done above)
+
+```{python,eval=F}
+# Import tools
+import numpy as np # type: ignore
+from fastlmm.association import single_snp # type: ignore
+from fastlmm.association import single_snp_linreg # type: ignore
+from fastlmm.util import example_file # type: ignore
+import pandas as pd # type: ignore
+import os
+
+# Define data paths for fast LMM function arguments
+bed_path = 'fastLMM.bed'
+pheno_path = 'fastLMM_clean.fam'
+ld_bed = 'fastLMM_ld.bed'
+
+bed_path_covar = 'fastLMM_covar.bed'
+pheno_path_covar = 'fastLMM_covar_clean.fam'
+ld_bed_covar = 'fastLMM_covar_ld.bed'
+covar_path_covar = 'multi_column_covar.fam'
+
+################################################################################################################
+
+# No covariates
+print("# Running GWAS with No Covariates")
+## Lin-reg
+print("# Model: Linear Regression without Covariates")
+gwas_results = single_snp_linreg(bed_path, pheno_path, count_A1=True)
+gwas_results.to_csv('testing.tsv', sep = '\t')
+## Distance matrix
+print("# Model: Mixed Model (Distance Matrix) without Covariates")
+gwas_results = single_snp(bed_path, pheno_path, K0=ld_bed, count_A1=True).sort_values('PValue')
+gwas_results.to_csv('testing_K0_ld.tsv', sep = '\t')
+
+# Covariates
+print("# Running GWAS with Covariates")
+## Lin-reg
+print("# Model: Linear Regression with Covariates")
+gwas_results = single_snp_linreg(bed_path_covar, pheno_path_covar, covar=covar_path_covar, count_A1=True)
+gwas_results.to_csv('testing_covar.tsv', sep = '\t')
+## Distance matrix
+print("# Model: Mixed Model (Distance Matrix) with Covariates")
+gwas_results =  single_snp(bed_path_covar, pheno_path_covar, K0=ld_bed_covar, covar=covar_path_covar, count_A1=True).sort_values('PValue')
+gwas_results.to_csv('testing_K0_ld_covar.tsv', sep = '\t')
+
+```
+
+# Script to generate plots in R (done above)
+
+```{R,eval=F}
+#!/usr/bin/Rscript 
+#!/usr/bin/env R 4.3.1
+
+# Packages
+library(tidyverse)
+library(data.table)
+library(scales)
+library(QCEWAS)
+library(ggExtra)
+
+# p-value threshold
+n_snps <- read_tsv("fastLMM_ld.bim", col_names = FALSE) %>% nrow()
+p_cutoff <- 0.05 / n_snps
+
+# Manhattan
+my_manhattan <- function(gwasResults){
+  # Convert Chr to factor and arrange
+  gwasResults <- gwasResults %>%
+    mutate(Chr = as.factor(as.numeric(as.character(Chr)))) %>% 
+    select(-SNP) %>%
+    arrange(Chr, ChrPos)
+
+  # Add SNP index
+  gwasResults <- gwasResults %>%
+    add_column(SNP = 1:nrow(.))
+
+  # Compute chromosome label positions (midpoint of SNP index per Chr)
+  chr_labels <- gwasResults %>%
+    group_by(Chr) %>%
+    summarise(center = mean(SNP), .groups = "drop")
+
+  # Compute -log10(p) and size
+  gwasResults <- gwasResults %>%
+    mutate(logP = -log10(PValue),
+           size = ifelse(logP > -log10(p_cutoff), scales::rescale(logP, to = c(1.5, 5)), 1))
+
+  # Plot
+  ggplot(gwasResults, aes(x = SNP, y = logP, colour = Chr, size = size)) +
+    geom_point() + 
+    geom_hline(yintercept = -log10(p_cutoff), linetype = 2) +               # Bonferroni line
+    geom_hline(yintercept = -log10(1e-4), linetype = "dotted") +           # Suggestive line
+    scale_colour_viridis_d() +
+    scale_size_identity() +
+    scale_x_continuous(
+        breaks = chr_labels$center,
+        labels = chr_labels$Chr
+    ) +
+    labs(
+        x = "Chromosome",
+        y = expression(-log[10]("P-value"))
+    ) +
+    theme(
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.position = "none"
+    )
+}
+
+
+#QQ Plot
+my_qq_plot <- function(gwasResults) {
+    pvector <- gwasResults %>%
+        filter(PValue > 0 & PValue < 1 & !is.na(PValue) & !is.nan(PValue) & is.finite(PValue)) %>%
+        pull(PValue) 
+
+    o = -log10(sort(pvector, decreasing = FALSE))
+    e = -log10(ppoints(length(pvector)))
+
+    tmp_plot <- as.data.frame(o) %>%
+        cbind(
+            as.data.frame(e)
+        ) %>% 
+        ggplot(aes(x = e, y = o)) +
+            geom_point(colour = "#1F968BFF") + 
+            xlab(expression(Expected ~ ~-log[10](italic(p)))) +
+            ylab(expression(Observed ~ ~-log[10](italic(p)))) +
+            geom_abline(colour = "#440154FF")  +
+    theme(
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14)
+    )
+
+    ggMarginal(tmp_plot, type = "histogram", bins = 50)
+}
+
+#lambda
+my_lambda <- function(gwasResults){
+    gwasResults %>% 
+        select(PValue) %>% 
+        na.omit() %>%
+        pull() %>%
+        P_lambda() 
+}
+
+# Pulling it all together
+my_gwas_outputs <- function(file_path){
+    gwasResults <- read_tsv(file_path) %>%
+        mutate(Chr = as.factor(Chr), 
+            SNP = str_remove(SNP, "ordered_PKNH_"),
+            SNP = str_remove(SNP, "new"),
+            SNP = as.factor(SNP)) 
+
+    man_ggplot <- my_manhattan(gwasResults)
+    ggsave(paste0("manhattan_", str_remove(file_path, ".tsv"), ".png"), dpi = 300, width = 20, man_ggplot)
+
+    qq_ggplot <- my_qq_plot(gwasResults)
+    ggsave(paste0("qq_", str_remove(file_path, ".tsv"), ".png"), dpi = 300, qq_ggplot)
+
+    my_lambda(gwasResults) %>%
+        write.table(paste0("lambda_", str_remove(file_path, ".tsv"), ".txt"), col.names = FALSE, sep = "\t") 
+
+    gwasResults %>% 
+        filter(PValue < p_cutoff) %>%
+        write.table(paste0("sig_snps_", str_remove(file_path, ".tsv"), ".txt"), col.names = FALSE, sep = "\t") 
+
+    gwasResults %>% 
+        filter(PValue < 1e-4) %>%
+        write.table(paste0("suggestive_snps_", str_remove(file_path, ".tsv"), ".txt"), col.names = FALSE, sep = "\t")
+}
+
+gwasResults_path_list <- list.files(pattern="^testing") 
+
+for (i in gwasResults_path_list){
+    my_gwas_outputs(paste0(i))
+}
+```
+
+# Annotate variants 
+
+```{bash,eval=F}
+export PATH=$PATH:/g/data/pq84/bin/ensembl-vep
+
+GFF="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz"
+FASTA="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/strain_A1_H.1.Icor.fasta"
+
+vep -i Consensus_SNPs_subset_no_MOI.vcf.gz --gff $GFF --fasta $FASTA -o snp_annotation.txt --force_overwrite --everything
+```
+
+```{R,eval=F}
+library(tidyverse)
+library(janitor)
+
+# Load suggestive SNPs
+suggestive <- read_tsv("suggestive_snps_testing_K0_ld.txt", col_names = FALSE)
+
+# Extract and clean variant string (4th column is the variant ID)
+suggestive <- suggestive %>%
+  rename(variant_id = X4) %>%
+  mutate(variant_id = str_remove_all(variant_id, '"')) %>%
+  separate(variant_id, into = c("chr", "pos", "ref", "alt", "extra"), sep = ":", remove = FALSE) %>%
+  mutate(chr = str_remove(chr, "_v2"),  # remove "_v2" from chr
+         uploaded_var = paste0("ordered_PKNH_", chr, "_v2_", pos, "_", ref, "/", alt))
+
+# Load annotation file (skip metadata headers with `comment`)
+annotation <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/snp_annotation.txt",
+                       comment = "##") %>%
+  clean_names()
+
+# Confirm the column name in annotation
+# colnames(annotation)
+
+# Perform left join using correct column name from annotation
+suggestive_annotated <- suggestive %>%
+  left_join(annotation, by = c("uploaded_var" = "number_uploaded_variation"))
+
+# Save result
+write_tsv(suggestive_annotated, "suggestive_snps_with_annotation.tsv")
+```
+
+############################################################
+
+# Common practice - 10 & 10 & MAF 5 (PCs and batch covariates)
+
+## Set up PLINK inputs
+
+```{bash,eval=F}
+cd /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/
+
+mkdir -p fastlmm_updated_framework/geno_10/MAF_5
+
+plink --bfile Pk --recode --set-hh-missing --out fastlmm_updated_framework/geno_10/cleaned
+plink --file fastlmm_updated_framework/geno_10/cleaned --geno 0.20 --make-bed --out fastlmm_updated_framework/geno_10/cleaned
+plink --bfile fastlmm_updated_framework/geno_10/cleaned --recode --out fastlmm_updated_framework/geno_10/cleaned
+plink --file fastlmm_updated_framework/geno_10/cleaned --mind 0.1 --make-bed --out fastlmm_updated_framework/geno_10/cleaned
+plink --bfile fastlmm_updated_framework/geno_10/cleaned --recode --out fastlmm_updated_framework/geno_10/cleaned
+plink --file fastlmm_updated_framework/geno_10/cleaned --geno 0.1 --make-bed --out fastlmm_updated_framework/geno_10/cleaned
+plink --file fastlmm_updated_framework/geno_10/cleaned --maf 0.05 --make-bed --out fastlmm_updated_framework/geno_10/MAF_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_10/MAF_5/cleaned --pca --out fastlmm_updated_framework/geno_10/MAF_5/cleaned
+cd fastlmm_updated_framework/geno_10/MAF_5
+
+```
+
+
+## Metadata
+
+```{R,eval=F}
+# Packages
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(ggExtra)
+
+# Metadata
+metadata <- read_csv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/full_dataset_011223.csv") %>%
+    rename(Sample = studycode) %>% 
+    add_column(Cluster = NA) %>% 
+    mutate(sevemal = ifelse(grepl("Um", sevemal), "Um", 
+        ifelse(sevemal == "1", "Sm",
+        ifelse(sevemal == "0", "Um", .$sevemal)))) %>%
+    mutate(Sample = str_to_upper(Sample)) %>% 
+    unique()
+
+original_metadata <- readxl::read_xlsx("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/PK_Sabah_Sample_naming_indexes.xlsx") %>%
+    select(1:3) %>%
+    mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+        ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+        .$subjectid))) %>%
+    unite(Sample, c("group", "subjectid"), sep ="") %>% 
+    rename(Sample2 = sampleid)
+
+metadata <- metadata %>%
+    left_join(original_metadata) %>%
+    mutate(Sample2 = ifelse(is.na(Sample2), Sample, Sample2)) %>%
+    select(-Sample) %>%
+    rename(Sample = Sample2) %>%
+    relocate(Sample)
+    
+    
+archived_data <- read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_metadata.csv") %>%
+        select(1, 3, 5) %>% 
+        rename(district = area) %>%
+        mutate(Cluster = str_remove(Group, "-Pk")) %>% 
+        select(-Group) %>% 
+        rbind(read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_peninsular_metadata.csv") %>%
+        select(2, 8) %>%
+        rename(Sample = ENA_accession_no_ES) %>%
+        rename(district = Location) %>%
+        add_column(Cluster = "Peninsular")
+        ) %>%
+        add_column(enroldate=NA, age = NA, sex=NA, ethnicity=NA, village=NA, occupation=NA, Hb=NA, platelets=NA,
+        parasitemia=NA, fever=NA, respiratory_rate=NA, oxygen_saturation=NA, systolic_BP=NA, diastolic_BP=NA, G6PD=NA,
+        pregnant=NA, creatinine=NA, study=NA, bicarbonate=NA, PCR=NA, sevemal=NA, bilirubin=NA, glucose=NA, bleeding_severity=NA)
+
+
+metadata <- metadata %>%
+    rbind(archived_data)
+
+# Basic Model
+Plink_fam <- read.table("cleaned.fam", sep =" ") %>% 
+    mutate(Sample = str_remove(V1, "_DK.*")) %>% 
+    mutate(Sample = ifelse(!grepl("PK_SB_DNA", Sample), str_replace(Sample, "_", "-"), Sample)) %>% 
+    left_join(metadata) %>% 
+    select(-Sample) %>%
+    select(1:5, sevemal) %>%
+    mutate(sevemal = ifelse(sevemal == "Sm", 2, 1))
+
+# Duplicate samples 
+dups <- Plink_fam %>% # get original dup name to remove during recoding step
+    group_by(V1) %>%
+    summarise(n = n()) %>%
+    filter(n >= 2) 
+
+Plink_fam <- Plink_fam %>% # give dups different names - otherwise PLINK freaks out
+    filter(V1 != dups$V1) %>% 
+    rbind(
+        Plink_fam %>% 
+            filter(V1 %in% dups$V1) %>%
+            group_by(V1) %>%
+            add_column(temp = 1:nrow(.)) %>%
+            ungroup() %>%
+            mutate(V1 = ifelse(temp > 1, paste0(V1, "_2"), V1)) %>%
+            mutate(V2 = ifelse(temp > 1, paste0(V2, "_2"), V2)) %>%
+            select(-temp)
+    )
+
+# updated fam file
+write.table(Plink_fam, "cleaned.fam", quote = FALSE, sep = " ", col.names = FALSE, row.names = FALSE)
+
+# samples to exclude
+Plink_fam %>% 
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% # samples that cluster alone in PCA
+    unique() %>%
+    write_tsv("samples_to_exclude.tsv", col_names=F)
+
+
+# Covariate models
+## metadata - covariates
+multi_covar <- Plink_fam %>%
+    as_tibble() %>%
+    mutate(batch = ifelse(grepl("PK_SB_DNA_", V1), 1, 2)) %>%
+    left_join(
+        read.table("cleaned.eigenvec") %>%
+        as_tibble() %>%
+        select(V1, PC1 = V3, PC2 = V4, PC3 = V5, PC4 = V6, PC5 = V7),
+        by = "V1"
+    )
+
+multi_covar %>%
+    select(V1, V2, batch, PC1, PC2, PC3, PC4, PC5) %>%
+    filter(!is.na(batch)) %>% 
+    na.omit() %>%
+    write_tsv("multi_column_covar.fam", col_names = F)
+
+## samples to exclude 
+multi_covar %>%
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% 
+    write_tsv("samples_to_exclude_covar.tsv", col_names = F)
+```
+
+## Recode for fastLMM 
+
+```{bash,eval=F}
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude.tsv --out fastLMM
+plink --file fastLMM --indep-pairwise 100 5 0.2 --out fastLMM_ld
+plink --bfile fastLMM --recode --make-bed --exclude fastLMM_ld.prune.out --out fastLMM_ld
+cat fastLMM.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_clean.fam
+
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude_covar.tsv --out fastLMM_covar
+plink --file fastLMM_covar --indep-pairwise 100 5 0.2 --out fastLMM_covar_ld
+plink --bfile fastLMM_covar --recode --make-bed --exclude fastLMM_covar_ld.prune.out --out fastLMM_covar_ld
+cat fastLMM_covar.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_covar_clean.fam
+
+python3 /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/fastlmm_updated_2.0.py
+Rscript /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/gwas_plots_updated_2.0.R
+
+rm -f cleaned* fast* cluster* plink*
+```
+
+############################################################
+
+# Looser filters - 20 & 20 & MAF 5 (PCs and batch covariates)
+
+## Set up PLINK inputs
+
+```{bash,eval=F}
+cd /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/
+
+mkdir -p fastlmm_updated_framework/geno_20/MAF_5
+
+plink --bfile Pk --recode --set-hh-missing --out fastlmm_updated_framework/geno_20/cleaned
+plink --file fastlmm_updated_framework/geno_20/cleaned --geno 0.20 --make-bed --out fastlmm_updated_framework/geno_20/cleaned
+plink --bfile fastlmm_updated_framework/geno_20/cleaned --recode --out fastlmm_updated_framework/geno_20/cleaned
+plink --file fastlmm_updated_framework/geno_20/cleaned --mind 0.20 --make-bed --out fastlmm_updated_framework/geno_20/cleaned
+plink --bfile fastlmm_updated_framework/geno_20/cleaned --recode --out fastlmm_updated_framework/geno_20/cleaned
+plink --file fastlmm_updated_framework/geno_20/cleaned --geno 0.20 --make-bed --out fastlmm_updated_framework/geno_20/cleaned
+plink --file fastlmm_updated_framework/geno_20/cleaned --maf 0.05 --make-bed --out fastlmm_updated_framework/geno_20/MAF_5/cleaned
+plink --bfile fastlmm_updated_framework/geno_20/MAF_5/cleaned --pca --out fastlmm_updated_framework/geno_20/MAF_5/cleaned
+cd fastlmm_updated_framework/geno_20/MAF_5
+```
+
+
+## Metadata
+
+```{R,eval=F}
+# Packages
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(ggExtra)
+
+# Metadata
+metadata <- read_csv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/full_dataset_011223.csv") %>%
+    rename(Sample = studycode) %>% 
+    add_column(Cluster = NA) %>% 
+    mutate(sevemal = ifelse(grepl("Um", sevemal), "Um", 
+        ifelse(sevemal == "1", "Sm",
+        ifelse(sevemal == "0", "Um", .$sevemal)))) %>%
+    mutate(Sample = str_to_upper(Sample)) %>% 
+    unique()
+
+original_metadata <- readxl::read_xlsx("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/PK_Sabah_Sample_naming_indexes.xlsx") %>%
+    select(1:3) %>%
+    mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+        ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+        .$subjectid))) %>%
+    unite(Sample, c("group", "subjectid"), sep ="") %>% 
+    rename(Sample2 = sampleid)
+
+metadata <- metadata %>%
+    left_join(original_metadata) %>%
+    mutate(Sample2 = ifelse(is.na(Sample2), Sample, Sample2)) %>%
+    select(-Sample) %>%
+    rename(Sample = Sample2) %>%
+    relocate(Sample)
+    
+    
+archived_data <- read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_metadata.csv") %>%
+        select(1, 3, 5) %>% 
+        rename(district = area) %>%
+        mutate(Cluster = str_remove(Group, "-Pk")) %>% 
+        select(-Group) %>% 
+        rbind(read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_peninsular_metadata.csv") %>%
+        select(2, 8) %>%
+        rename(Sample = ENA_accession_no_ES) %>%
+        rename(district = Location) %>%
+        add_column(Cluster = "Peninsular")
+        ) %>%
+        add_column(enroldate=NA, age = NA, sex=NA, ethnicity=NA, village=NA, occupation=NA, Hb=NA, platelets=NA,
+        parasitemia=NA, fever=NA, respiratory_rate=NA, oxygen_saturation=NA, systolic_BP=NA, diastolic_BP=NA, G6PD=NA,
+        pregnant=NA, creatinine=NA, study=NA, bicarbonate=NA, PCR=NA, sevemal=NA, bilirubin=NA, glucose=NA, bleeding_severity=NA)
+
+
+metadata <- metadata %>%
+    rbind(archived_data)
+
+# Basic Model
+Plink_fam <- read.table("cleaned.fam", sep =" ") %>% 
+    mutate(Sample = str_remove(V1, "_DK.*")) %>% 
+    mutate(Sample = ifelse(!grepl("PK_SB_DNA", Sample), str_replace(Sample, "_", "-"), Sample)) %>% 
+    left_join(metadata) %>% 
+    select(-Sample) %>%
+    select(1:5, sevemal) %>%
+    mutate(sevemal = ifelse(sevemal == "Sm", 2, 1))
+
+# Duplicate samples 
+dups <- Plink_fam %>% # get original dup name to remove during recoding step
+    group_by(V1) %>%
+    summarise(n = n()) %>%
+    filter(n >= 2) 
+
+Plink_fam <- Plink_fam %>% # give dups different names - otherwise PLINK freaks out
+    filter(V1 != dups$V1) %>% 
+    rbind(
+        Plink_fam %>% 
+            filter(V1 %in% dups$V1) %>%
+            group_by(V1) %>%
+            add_column(temp = 1:nrow(.)) %>%
+            ungroup() %>%
+            mutate(V1 = ifelse(temp > 1, paste0(V1, "_2"), V1)) %>%
+            mutate(V2 = ifelse(temp > 1, paste0(V2, "_2"), V2)) %>%
+            select(-temp)
+    )
+
+# updated fam file
+write.table(Plink_fam, "cleaned.fam", quote = FALSE, sep = " ", col.names = FALSE, row.names = FALSE)
+
+# samples to exclude
+Plink_fam %>% 
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% # samples that cluster alone in PCA
+    unique() %>%
+    write_tsv("samples_to_exclude.tsv", col_names=F)
+
+
+# Covariate models
+## metadata - covariates
+multi_covar <- Plink_fam %>%
+    as_tibble() %>%
+    mutate(batch = ifelse(grepl("PK_SB_DNA_", V1), 1, 2)) %>%
+    left_join(
+        read.table("cleaned.eigenvec") %>%
+        as_tibble() %>%
+        select(V1, PC1 = V3, PC2 = V4, PC3 = V5, PC4 = V6, PC5 = V7),
+        by = "V1"
+    )
+
+multi_covar %>%
+    select(V1, V2, batch, PC1, PC2, PC3, PC4, PC5) %>%
+    filter(!is.na(batch)) %>% 
+    na.omit() %>%
+    write_tsv("multi_column_covar.fam", col_names = F)
+
+## samples to exclude 
+multi_covar %>%
+    filter(is.na(sevemal) | grepl(dups$V1, V1) | V1 == "PK_SB_DNA_094_DKDL210002223-1a_HWHGKDSXY_L4") %>% 
+    write_tsv("samples_to_exclude_covar.tsv", col_names = F)
+
+```
+
+## Recode for fastLMM 
+
+```{bash,eval=F}
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude.tsv --out fastLMM
+plink --file fastLMM --indep-pairwise 100 5 0.2 --out fastLMM_ld
+plink --bfile fastLMM --recode --make-bed --exclude fastLMM_ld.prune.out --out fastLMM_ld
+cat fastLMM.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_clean.fam
+
+plink --bfile cleaned --recode --make-bed --remove samples_to_exclude_covar.tsv --out fastLMM_covar
+plink --file fastLMM_covar --indep-pairwise 100 5 0.2 --out fastLMM_covar_ld
+plink --bfile fastLMM_covar --recode --make-bed --exclude fastLMM_covar_ld.prune.out --out fastLMM_covar_ld
+cat fastLMM_covar.fam | awk '{print $1 "\t" $2 "\t" $6}' > fastLMM_covar_clean.fam
+
+python3 /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/fastlmm_updated_2.0.py
+Rscript /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/scripts/05_Analyses/GWAS/finding_optimal_model/gwas_plots_updated_2.0.R
+
+rm -f cleaned* fast* cluster* plink*
+```
+
+############################################################
+
+
+# Comparing models 
+
+```{bash,eval=F}
+cd /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/fastlmm_updated_framework/
+R
+```
+
+
+```{R,eval=F}
+library(tidyverse)
+
+# Genotype filtering subdirectories
+geno_dirs <- list.dirs(recursive = FALSE, full.names = TRUE)
+
+# Model suffixes to check
+suffixes <- c("", "_K0_ld", "_K0_ld_covar", "_covar")
+
+# Initialize list for results
+results <- list()
+
+for (gdir in geno_dirs) {
+    filter_name <- basename(gdir)
+    maf5_dir <- file.path(gdir, "MAF_5")
+
+    for (suf in suffixes) {
+        model_label <- ifelse(suf == "", "default", sub("^_", "", suf))
+
+        # Define file paths
+        lambda_file <- file.path(maf5_dir, paste0("lambda_testing", suf, ".txt"))
+        sig_file <- file.path(maf5_dir, paste0("sig_snps_testing", suf, ".txt"))
+        sugg_file <- file.path(maf5_dir, paste0("suggestive_snps_testing", suf, ".txt"))
+        assoc_file <- file.path(maf5_dir, paste0("testing", suf, ".tsv"))
+
+        # Extract lambda (assumes 2-column tsv with numeric in second col)
+        lambda_val <- tryCatch({
+        read_tsv(lambda_file, col_names = FALSE, show_col_types = FALSE)[[2]][1]
+        }, error = function(e) NA)
+
+        # Count non-header rows in sig and suggestive files
+        sig_hits <- tryCatch({
+        nrow(read_tsv(sig_file, show_col_types = FALSE))
+        }, error = function(e) 0)
+
+        sugg_hits <- tryCatch({
+        nrow(read_tsv(sugg_file, show_col_types = FALSE))
+        }, error = function(e) 0)
+
+        # Minimum p-value
+        min_pval <- tryCatch({
+        df <- read_tsv(assoc_file, show_col_types = FALSE)
+        if ("PValue" %in% colnames(df)) min(df$PValue, na.rm = TRUE) else NA
+        }, error = function(e) NA)
+
+        # Store result
+        results[[length(results) + 1]] <- tibble(
+        filtering = filter_name,
+        model = model_label,
+        lambda = lambda_val,
+        sig_hits = sig_hits,
+        suggestive_hits = sugg_hits,
+        min_p_value = min_pval
+        )
+    }
+}
+
+# Combine and view
+comparison_df <- bind_rows(results) %>%
+    mutate(lambda_deviation = abs(lambda - 1)) %>%
+    arrange(lambda_deviation) %>%
+    na.omit()
+
+print(comparison_df, n = 40) %>%
+    select(filtering, model)
+
+write_tsv(comparison_df, "gwas_model_comparison_summary.tsv")
+```
+
+
+# Best model =  geno_5 + K0_ld 
+
+## No significant hits, but suggestive hits 
+## But all intergenic
+## Look for nearby genes
+
+# Annotate variants 
+
+```{bash,eval=F}
+export PATH=$PATH:/g/data/pq84/bin/ensembl-vep
+
+GFF="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz"
+FASTA="/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/strain_A1_H.1.Icor.fasta"
+
+vep -i Consensus_SNPs_subset_no_MOI.vcf.gz --gff $GFF --fasta $FASTA -o snp_annotation.txt --force_overwrite --everything
+
+plink --bfile fastLMM --freq --out allele_freqs
+
+plink --bfile fastLMM --freq case-control --out allele_freqs_by_pheno --allow-no-sex
+```
+
+```{R,eval=F}
+library(tidyverse)
+library(janitor)
+
+# Load suggestive SNPs
+suggestive <- read_tsv("suggestive_snps_testing_K0_ld.txt")
+
+# Extract and clean variant string (4th column is the variant ID)
+suggestive <- suggestive %>%
+  rename(variant_id = Chr) %>%
+  mutate(variant_id = str_remove_all(variant_id, '"')) %>%
+  separate(variant_id, into = c("chr", "pos", "ref", "alt", "extra"), sep = ":", remove = FALSE) %>%
+  mutate(chr = str_remove(chr, "_v2"),  # remove "_v2" from chr
+         uploaded_var = paste0("ordered_PKNH_", chr, "_v2_", pos, "_", ref, "/", alt))
+
+# Load annotation file (skip metadata headers with `comment`)
+annotation <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/snp_annotation.txt",
+                       comment = "##") %>%
+    clean_names()
+
+# Perform left join using correct column name from annotation
+suggestive_annotated <- suggestive %>%
+    left_join(annotation, by = c("uploaded_var" = "number_uploaded_variation"))
+
+# Save result
+write_tsv(suggestive_annotated, "suggestive_snps_with_annotation.tsv")
+
+
+# Nearest genes
+
+# 3. Load GFF: extract gene ID and product
+genes <- read_tsv(
+    "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz",
+    comment = "#", col_names = FALSE
+    ) %>%
+    filter(X3 == "gene") %>%
+    transmute(
+        chr = X1,
+        gene_start = as.integer(X4),
+        gene_end = as.integer(X5),
+        gene_id = str_extract(X9, "(?<=ID=)[^;]+")
+    )
+
+products <- read_tsv(
+    "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz",
+    comment = "#", col_names = FALSE
+    ) %>%
+    filter(X3 == "polypeptide") %>%
+    transmute(
+        derives_from = str_extract(X9, "(?<=Derives_from=)[^;]+"),
+        product = URLdecode(str_match(X9, "product=([^;]+)")[,2])
+    ) %>%
+    mutate(gene_id = str_remove(derives_from, "\\.1$"))
+
+gff <- genes %>%
+    left_join(products %>% select(gene_id, product), by = "gene_id")
+
+# Normalize `chr` to match the GFF format (e.g. "12" -> "PKNH_12_v2")
+suggestive_annotated <- suggestive_annotated %>%
+    mutate(chr_gff = paste0("PKNH_", str_pad(chr, 2, pad = "0"), "_v2"))
+
+# 4. Function to find nearest gene within ±50 kb
+find_nearest_gene <- function(chr, pos) {
+    # Ensure chr format matches GFF naming
+    formatted_chr <- if (!startsWith(chr, "ordered_")) paste0("ordered_", chr) else chr
+
+    # Filter GFF by chromosome
+    genes_on_chr <- gff %>% filter(chr == formatted_chr)
+    
+    if (nrow(genes_on_chr) == 0) return(tibble(nearby_gene = NA_character_, distance_to_gene = NA_integer_))
+    
+    # Calculate distances
+    genes_on_chr <- genes_on_chr %>%
+        mutate(dist = pmin(abs(pos - gene_start), abs(pos - gene_end)))
+    
+    # Get the closest gene
+    nearest_gene <- genes_on_chr %>%
+        arrange(dist) %>%
+        slice(1)
+    
+    tibble(
+        nearby_gene = paste0(
+            nearest_gene$gene_id,
+            if (!is.na(nearest_gene$product)) paste0(" (", nearest_gene$product, ")") else ""
+        ),
+        distance_to_gene = nearest_gene$dist
+    )
+}
+
+suggestive_final <- suggestive_annotated %>%
+    mutate(pos = as.integer(pos)) %>%
+    bind_cols(
+        map2_dfr(.$chr_gff, .$pos, find_nearest_gene)
+    )
+
+suggestive_final %>%
+    filter(grepl("normocyte", nearby_gene))
+
+    
+# 7. Save output
+suggestive_final %>%
+    select(variant_id, SNP, PValue, SnpWeight, SnpWeightSE, EffectSize, gene, consequence, nearby_gene, distance_to_gene) %>% 
+    write_tsv("suggestive_snps_with_annotation_and_gene_descriptions.tsv")
+
+
+suggestive_final %>% 
+    arrange(PValue) %>% 
+    select(variant_id, SNP, PValue, SnpWeight, SnpWeightSE, EffectSize, gene, consequence, nearby_gene, distance_to_gene) %>% 
+    head(n=200) %>% 
+    filter(grepl("SICA", nearby_gene)) %>%
+    write_tsv("top_200_suggestive_snps_nearby_genes.tsv")
+
+suggestive_final %>% 
+    arrange(PValue) %>% 
+    filter(grepl("dbp", nearby_gene))
+
+suggestive_final %>% 
+    arrange(PValue) %>% 
+    select(nearby_gene, PValue) %>% 
+    head(n=200) %>% 
+    print(n=200)
+
+
+
+
+# 8. Check case/control allele frequencies
+freq_cc <- read.table("allele_freqs_by_pheno.frq.cc", header = TRUE) %>%
+    as_tibble() %>%
+    clean_names() %>%
+    mutate(snp = str_remove(snp, "ordered_PKNH_")) %>%
+    dplyr::rename(SNP = snp) 
+
+# Quick check: how many SNPs have any non-zero observations?
+nonzero_counts <- freq_cc %>%
+  filter(nchrobs_a > 0 & nchrobs_u > 0)
+
+suggestive_with_freqs <- suggestive_final %>%
+  left_join(freq_cc, by = "SNP")
+
+suggestive_with_freqs <- suggestive_with_freqs %>%
+  mutate(delta_maf = maf_a - maf_u) %>%
+  select(variant_id, SNP, PValue, SnpWeight, EffectSize, a1, a2, maf_a, maf_u, delta_maf, EffectSize, consequence, nearby_gene, distance_to_gene) %>%
+  arrange(PValue) 
+
+suggestive_direction <- suggestive_with_freqs %>%
+  mutate(
+    delta_maf = maf_a - maf_u,
+    direction = case_when(
+      delta_maf > 0 & EffectSize > 0 ~ "risk",        # allele enriched in severe, increases odds
+      delta_maf > 0 & EffectSize < 0 ~ "inconsistent",# enriched in severe but negative beta
+      delta_maf < 0 & EffectSize < 0 ~ "protective",  # allele enriched in control, decreases odds
+      delta_maf < 0 & EffectSize > 0 ~ "inconsistent",# enriched in control but positive beta
+      TRUE ~ "unclear"
+    )
+  ) %>%
+  select(variant_id, SNP, PValue, a1, a2, maf_a, maf_u, delta_maf, EffectSize, direction, consequence, nearby_gene, distance_to_gene) %>%
+  arrange(PValue)
+
+print(suggestive_direction)
+
+write_tsv(suggestive_direction, "suggestive_snps_with_direction_&_annotation.tsv")
+
+freq_plot <- ggplot(suggestive_with_freqs, aes(x = maf_u, y = maf_a, label = SNP)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_text(nudge_y = 0.02, size = 3, check_overlap = TRUE) +
+    labs(x = "Control (Um) MAF", y = "Case (Sm) MAF")
+
+ggsave("allele_frequencies_case_control_plot.png", plot = freq_plot, dpi = 300)
+
+
+
+# 9) Label major/minor (cohort-wide) and identify the risk allele
+# Overall cohort frequencies: A1 is the minor allele; MAF is its freq
+freq_all <- read.table("allele_freqs.frq", header = TRUE) %>%
+    as_tibble() %>%
+    clean_names() %>%
+    mutate(snp = str_remove(snp, "ordered_PKNH_")) %>%   # match your suggestive table's SNP format
+    rename(SNP = snp) %>%
+    transmute(
+        chr,
+        SNP,
+        a1_minor = a1,                     # A1 is minor (standard PLINK --freq)
+        a2_major = a2,
+        maf_overall = maf,                 # freq(minor) in the whole cohort
+        major_freq_overall = 1 - maf
+    )
+
+# Merge overall (minor/major) labels + case/control A1 freqs into your directional table
+severity_with_minor_major <- suggestive_direction %>%   # this is the table you built earlier
+    left_join(freq_all, by = "SNP") %>%
+    mutate(
+        # Effect is per-copy of A1 (from your GWAS table). Positive beta => A1 increases odds of severity.
+        risk_allele = if_else(EffectSize > 0, a1, a2),
+        risk_is_minor = risk_allele == a1_minor,
+        risk_label = if_else(EffectSize > 0, "risk", "protective"),
+
+        # Nice human-readable allele labels
+        minor_allele = a1_minor,
+        major_allele = a2_major
+    ) %>%
+    select(
+        variant_id, SNP, PValue, EffectSize,
+        # allele labelling
+        minor_allele, major_allele, maf_overall, major_freq_overall,
+        # case/control A1 freqs for context (A1 here is not re-labeled; it’s the PLINK A1 in frq.cc)
+        a1, a2, maf_a, maf_u, delta_maf,
+        # interpretation
+        risk_allele, risk_is_minor, risk_label,
+        consequence, nearby_gene, distance_to_gene
+    ) %>%
+    arrange(PValue)
+
+# (Optional) export a clean severity table for the manuscript/supplement
+readr::write_tsv(severity_with_minor_major, "severity_suggestive_with_minor_major_and_direction.tsv")
+
+# Quick sanity check summary:
+severity_with_minor_major %>%
+    count(risk_label, risk_is_minor)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# loci plots for interesting p-value peaks 
+
+Tat D - Chr 2: 99824 - 102470
+Several SNPs ~700bp from position - so include an extra 1000bp
+
+```{R,eval=F}
+library(tidyverse)
+library(janitor)
+
+# Manhattan function
+my_manhattan <- function(gwasResults){
+    gwasResults %>%
+    mutate(Chr = as.factor(Chr),
+        SNP = as.factor(SNP)) %>%
+        ggplot(aes(x = ChrPos, y = -log10(PValue), colour = MAF)) +
+        geom_point() + 
+        geom_hline(yintercept = -log10(0.00005), linetype = 2) + # adjusting the threshold assuming strong LD (up to 500 bases)
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+        scale_colour_viridis_c() 
+}
+
+# Subset
+loci_of_interest <- read_tsv("MAF_1/gwas_results_fast.tsv") %>% 
+    filter(Chr == 2 & ChrPos > 99824-50000 & ChrPos < 102470+50000) %>%
+    left_join(
+        read.table("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/Pk.frq") %>%  
+            row_to_names(1) %>%
+            select(SNP, MAF)
+    ) %>%
+    mutate(MAF = ifelse(PValue > 0.00005, 0, MAF)) %>%
+    mutate(MAF = as.numeric(MAF))
+
+
+# Plot Manhattan 
+man_ggplot <- my_manhattan(loci_of_interest)
+ggsave("MAF_1/loci_plot_tat_D.png", dpi = 300, man_ggplot)
+```

@@ -1,0 +1,2545 @@
+# Prepare data for eQTL analysis
+
+# Prepare environment
+
+```{bash,eval=F}
+start_pbs_big_boy
+module load R/4.3.1 
+module load htslib/1.16
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/eqtl/bin/activate
+export PATH=$PATH:/g/data/pq84/bin/plink2/
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl
+```
+
+# fastLMM method for eQTL analysis
+
+# 1. Prepare Expression Data for Significant Genes
+	•	Use the pre-filtered SummarizedExperiment object (filtered.rds) containing counts for all transcripts.
+	•	Subset to significant DE genes (e.g., from DESeq2/voom/edgeR) based on your chosen threshold (e.g., FDR < 0.05).
+	•	Apply a minimum expression filter:
+	•	Use edgeR’s filterByExpr() or a custom threshold (e.g., keep genes expressed in ≥30% of samples).
+	•	Consider logCPM transformation (e.g., via cpm(..., log=TRUE)).
+	•	Optionally collapse isoforms to genes using your a1h1_map.
+	•	Generate PCs.
+
+
+```{R,eval=F}
+# Load required libraries
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+library(limma)
+
+## Load SummarizedExperiment
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+counts <- round(assay(se))
+meta <- colData(se)
+
+# Read on filtered DE genes
+de_genes <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/significant_overlap_with_nonzero_counts_30_cutoff.tsv") %>%
+	pull(gene)
+
+# Subset count matrix to DE genes
+counts_de <- counts[rownames(counts) %in% de_genes, ]
+
+# Convert to logCPM
+logcpm_de <- cpm(counts_de, log = TRUE, prior.count = 1)
+
+# Plot histogram of mean logCPM per gene
+avg_logcpm <- rowMeans(logcpm_de, na.rm = TRUE)
+hist_plot <- ggplot(tibble(log2_mean_expr = avg_logcpm), aes(x = log2_mean_expr)) +
+	geom_histogram(bins = 50, fill = "#481567FF", color = "#55C667FF") +
+	geom_vline(xintercept = quantile(avg_logcpm, 0.99), linetype = "dashed", color = "red") +
+	labs(
+		x = "Mean log2 CPM",
+		y = "Number of transcripts"
+	)
+
+ggsave("mean_logcpm_histogram.png", plot = hist_plot, width = 8, height = 6)  
+
+# Inspect outliers - are they housekeeping genes?
+# Get transcript IDs for highest expressed transcripts
+high_abundance <- tibble(
+  transcript_id = rownames(logcpm_de),
+  mean_logcpm = avg_logcpm
+)
+
+# View top 10
+high_abundance %>% 
+  arrange(desc(mean_logcpm)) %>% 
+  head(10)
+
+# Calculate 99th percentile threshold
+upper_threshold <- quantile(avg_logcpm, 0.99)
+
+# Filter out highly expressed genes
+logcpm_de <- logcpm_de[avg_logcpm <= upper_threshold, ]
+
+# Save list of filtered-out transcripts
+filtered_out <- high_abundance %>%
+  filter(mean_logcpm > upper_threshold)
+
+write_tsv(filtered_out, "high_abundance_filtered_transcripts.tsv")
+
+# Reformat expression matrix: samples as rows, genes as columns
+expr_df <- as.data.frame(t(logcpm_de)) %>%
+	rownames_to_column("IID") %>%
+	mutate(FID = IID) %>%
+	select(FID, IID, everything())
+
+# Save expression matrix
+write_tsv(expr_df, "fastlmm_expression_matrix.tsv")
+
+# PCs for covariates
+# Normalize using TMM and voom (no covariates or design)
+dge <- DGEList(counts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, plot = FALSE)
+
+# Select top 1000 genes by variance (rows = genes, cols = samples)
+top_var_genes <- apply(v$E, 1, var) %>%
+	sort(decreasing = TRUE) %>%
+	head(1000) %>%
+	names()
+
+# PCA on samples
+pca <- prcomp(t(v$E[top_var_genes, ]), scale. = TRUE)
+
+# Format as FastLMM-compatible covariate file
+pca_df <- as.data.frame(pca$x[, 1:10]) %>%
+	rownames_to_column("IID") %>%
+	mutate(FID = IID) %>%
+	select(FID, IID, everything())  # FID and IID first
+
+# Save
+write_tsv(pca_df, "fastlmm_expr_pcs.tsv")
+```
+
+# 2. (Optional) Remove Highly Expressed or Housekeeping Genes
+	•	You can do this later (downstream) by:
+	•	Ranking genes by mean or variance across samples.
+	•	Removing known housekeeping genes (if annotated).
+	•	Removing top X% of genes by expression level to reduce bias.
+
+This step helps avoid global confounders that inflate signal at highly stable loci.
+
+# 3. Prepare Genotype Data
+	•	Use PLINK to filter and prepare genotype data:
+	•	Filter SNPs by MAF, call rate.
+	•	Calculate PCs.
+
+```{bash,eval=F}
+cp /g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/Pk* .
+plink --bfile Pk --set-hh-missing --make-bed --out cleaned
+plink --bfile cleaned --recode --out cleaned
+awk '$5 ~ /^[ACGT]$/ && $6 ~ /^[ACGT]$/' cleaned.bim > biallelic_snps.txt
+plink --bfile cleaned --extract biallelic_snps.txt --make-bed --out cleaned
+plink --bfile cleaned --recode --out cleaned
+plink --file cleaned --geno 0.20 --make-bed --out cleaned
+plink --bfile cleaned --recode --out cleaned
+plink --file cleaned --mind 0.05 --make-bed --out cleaned
+plink --bfile cleaned --recode --out cleaned
+plink --file cleaned --geno 0.05 --make-bed --out cleaned
+plink --bfile cleaned --recode --out cleaned
+plink --file cleaned --maf 0.05 --make-bed --out cleaned
+```
+
+Check for biallelic only: awk '!($5 ~ /^[ACGT]$/ && $6 ~ /^[ACGT]$/)' cleaned.bim | wc -l   # should be 0
+
+
+# 4. Filter for overlapping samples
+
+## Generate lsit of overlapping samples between genotype and expression data
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+
+# 1. Load sample IDs from PLINK .fam
+fam <- read_table("cleaned.fam", col_names = FALSE)
+colnames(fam)[1:2] <- c("FID", "IID")
+plink_samples <- as.tibble(fam$IID) %>%
+	filter(!grepl("ER|SR", value)) %>%
+	mutate(studyid = str_remove(value, "_DK.*")) %>%
+	dplyr::rename(plink = value)
+
+
+original_metadata <- readxl::read_xlsx("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/PK_Sabah_Sample_naming_indexes.xlsx") %>%
+	select(1:3) %>%
+	mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+		ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+		.$subjectid))) %>%
+	unite(sample2, c("group", "subjectid"), sep ="") %>% 
+	dplyr::rename(studyid = sampleid)
+
+# Pk formatted samples
+pk_samples <- plink_samples %>%
+	filter(grepl("PK", studyid)) %>%
+	left_join(original_metadata) %>%
+	mutate(studyid = sample2) %>%
+	select(-3)
+
+# Merge back into PLINK samples
+plink_samples <- plink_samples %>%
+	filter(!grepl("PK", studyid)) %>%
+	rbind(pk_samples) 
+
+# 2. Load sample IDs from RNA-seq RDS
+expr_samples <- read_tsv("fastlmm_expr_pcs.tsv") %>%
+	select(expr = 1) %>%
+	mutate(sampleid = str_remove(expr, "\\.txt"),
+		sampleid = str_remove(sampleid, "_DK.*")) %>%
+	left_join(read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/full_meta_for_de.tsv") %>%
+		select(sampleid, studyid), by = "sampleid") %>%
+	unique()
+	 
+# 3. Overlap samples
+overlap_samples <- plink_samples %>%
+	inner_join(expr_samples, by = "studyid")
+
+write_tsv(overlap_samples, "overlapping_samples_index.tsv", col_names = TRUE)
+
+# 4. Explore overlapping samples
+# Save PLINK-compatible sample list
+overlap_samples %>%
+	select(FID = plink, IID = plink) %>%
+	write_tsv("overlapping_samples.tsv", col_names = FALSE)
+
+# Define ordered PLINK sample IDs
+ordered_ids <- overlap_samples %>%
+  select(IID = plink) %>%
+  pull()
+
+# Filter and save expression matrix
+overlap_samples %>%
+	select(expr, plink) %>%
+	left_join(
+		read_tsv("fastlmm_expression_matrix.tsv") %>%
+			dplyr::rename(expr = IID)
+	) %>%
+	select(-expr) %>%
+	dplyr::rename(IID = plink) %>%
+	mutate(FID = IID) %>%
+	arrange(factor(IID, levels = ordered_ids)) %>%
+	write_tsv("fastlmm_expression_matrix_filtered.tsv")
+
+# Filter and save expression PCs
+read_tsv("fastlmm_expr_pcs.tsv") %>%
+  	filter(IID %in% overlap_samples$expr) %>%
+	arrange(factor(IID, levels = ordered_ids)) %>%
+	write_tsv("fastlmm_expr_pcs_filtered.tsv")
+
+# Removing duplicates
+
+# Read the fam cleanly (6 columns) and name them
+fam <- read_table(
+	"cleaned.fam", col_names = FALSE,
+	col_types = cols(.default = col_character())
+	) %>% 
+	setNames(c("FID","IID","PAT","MAT","SEX","PHENO"))
+
+# Tag duplicate rows by original FID+IID and create unique IDs for 2nd+ copies
+fam_dupfixed <- fam %>%
+	group_by(FID, IID) %>%
+	mutate(dup_idx = row_number()) %>%
+	ungroup() %>%
+	mutate(
+		FID_new = if_else(dup_idx > 1, paste0(FID, "_", dup_idx), FID),
+		IID_new = if_else(dup_idx > 1, paste0(IID, "_", dup_idx), IID)
+	)
+
+# Overwrite cleaned.fam with unique IDs so PLINK will load
+fam_out <- fam_dupfixed %>%
+  transmute(FID = FID_new, IID = IID_new, PAT, MAT, SEX, PHENO)
+
+stopifnot(nrow(fam_out) == nrow(distinct(fam_out, FID, IID)))
+write.table(fam_out, "cleaned.fam", quote = FALSE, sep = " ", col.names = FALSE, row.names = FALSE)
+
+# Build remove list = all renamed copies (the true duplicates)
+fam_dupfixed %>%
+	filter(dup_idx > 1) %>%
+	transmute(FID = FID_new, IID = IID_new) %>%
+	write_tsv("samples_to_exclude.tsv", col_names = FALSE)
+```
+
+```{bash,eval=F}
+plink --bfile cleaned --make-bed --remove samples_to_exclude.tsv --out cleaned
+plink --bfile cleaned --recode --make-bed --out cleaned
+
+plink --bfile cleaned --keep overlapping_samples.tsv --make-bed --out cleaned_overlap
+plink2 --bfile cleaned_overlap --pca 10 --out cleaned_overlap
+
+plink --bfile cleaned_overlap --recode --make-bed --out cleaned_overlap
+plink --file cleaned_overlap --indep-pairwise 100 5 0.2 --out cleaned_overlap_ld
+plink --bfile cleaned_overlap --recode --make-bed --exclude cleaned_overlap_ld.prune.out --out cleaned_overlap_ld
+```
+
+
+# Generate gene position data for target transcripts
+	•	Use A1H1 annotation to map transcripts to genes.
+	•	Generate a BED file with gene coordinates and transcript names.
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+
+# 'Map' transcript to gene using A1H1 annotation
+## A1H1 Map
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+	col_names = FALSE, 
+	comment = "#")
+
+colnames(tracking)[c(1, 3, 5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+		a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+		trinity = str_remove(trinity, "\\.path1.*"),
+		trinity = str_remove(trinity, "_i..*")) %>%
+	na.omit() %>%
+	unique()
+
+# Read expression data for target transcripts
+expr_ids <- read_tsv("fastlmm_expression_matrix_filtered.tsv") %>%
+	select(-c(FID, IID)) %>%
+	colnames()
+
+a1h1_map <- filter(a1h1_map, trinity %in% expr_ids)
+
+# Load only 'gene' entries from the GFF using readr
+gene_coords <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-68_PknowlesiA1H1.gff", comment = "#", col_names = FALSE) %>%
+	filter(X3 == "mRNA") %>%
+	transmute(
+		chr = X1,
+		start = X4,
+		end = X5,
+		gene_id = str_extract(X9, "Parent=([^;]+)") %>% str_remove("Parent=")
+	) %>%
+	distinct()
+
+# Combine gene coordinates with A1H1 map
+gene_coords <- gene_coords %>%
+	inner_join(a1h1_map, by = c("gene_id" = "a1h1"))
+
+# Correct chromosome names (genotype data used LSHTM annotation)
+# Build chromosome mapping table by order - PlasmoDB vs LSHTM
+chr_map <- tibble(
+	chr = paste0("LT7276", 48:99),  # GFF contigs (expression side)
+	new_chr = paste0("ordered_PKNH_", str_pad(1:(99 - 48 + 1), 2, pad = "0"), "_v2")
+)
+
+# Apply the mapping to the expression dataframe
+gene_coords_with_chr <- gene_coords %>%
+	left_join(chr_map, by = "chr") %>%
+	mutate(chr = new_chr) %>%
+	select(-new_chr) %>%
+	filter(chr != "ordered_PKNH_15_v2" & chr != "ordered_PKNH_16_v2")  %>% # Remove non-standard chromosomes
+	mutate(chr_plink = str_remove(chr, "_v2"), chr_plink = str_remove(chr_plink, "ordered_PKNH_")) %>%
+	mutate(chr_plink = as.numeric(chr_plink))
+
+write_tsv(gene_coords_with_chr, "gene_positions.tsv")
+
+# Subset expression data genes that we have coordinates for (ie. overlapping with a1h1_map)
+read_tsv("fastlmm_expression_matrix_filtered.tsv") %>%
+	select(FID, IID, all_of(intersect(colnames(.), gene_coords_with_chr$trinity))) %>%
+	write_tsv("fastlmm_expression_matrix_filtered_a1h1.tsv")
+```
+
+# 5. Generate Covariate and Phenotype File
+	•	Phenotype.
+	•	Combine PCs.
+
+```{R,eval=F}
+# Packages
+library(tidyverse)
+library(janitor)
+library(data.table)
+library(ggExtra)
+
+# Metadata
+metadata <- read_csv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/full_dataset_011223.csv") %>%
+	rename(Sample = studycode) %>% 
+	add_column(Cluster = NA) %>% 
+	mutate(sevemal = ifelse(grepl("Um", sevemal), "Um", 
+		ifelse(sevemal == "1", "Sm",
+		ifelse(sevemal == "0", "Um", .$sevemal)))) %>%
+	mutate(Sample = str_to_upper(Sample)) %>% 
+	unique()
+
+original_metadata <- readxl::read_xlsx("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/metadata/PK_Sabah_Sample_naming_indexes.xlsx") %>%
+	select(1:3) %>%
+	mutate(subjectid = ifelse(str_length(subjectid) == 1, paste0("00", subjectid), # if subjectid length = 1 paste 00
+		ifelse(str_length(subjectid) == 2, paste0("0", subjectid), # if not, then if subjectid length = 2 paste 0
+		.$subjectid))) %>%
+	unite(Sample, c("group", "subjectid"), sep ="") %>% 
+	rename(Sample2 = sampleid)
+
+metadata <- metadata %>%
+	left_join(original_metadata) %>%
+	mutate(Sample2 = ifelse(is.na(Sample2), Sample, Sample2)) %>%
+	select(-Sample) %>%
+	rename(Sample = Sample2) %>%
+	relocate(Sample)
+	
+	
+archived_data <- read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_metadata.csv") %>%
+		select(1, 3, 5) %>% 
+		rename(district = area) %>%
+		mutate(Cluster = str_remove(Group, "-Pk")) %>% 
+		select(-Group) %>% 
+		rbind(read_csv("/g/data/pq84/malaria/Pk_Malaysian_Population_Genetics/data/metadata/Pk_clusters_peninsular_metadata.csv") %>%
+			select(2, 8) %>%
+			rename(Sample = ENA_accession_no_ES) %>%
+			rename(district = Location) %>%
+			add_column(Cluster = "Peninsular")
+		) %>%
+		add_column(enroldate=NA, age = NA, sex=NA, ethnicity=NA, village=NA, occupation=NA, Hb=NA, platelets=NA,
+		parasitemia=NA, fever=NA, respiratory_rate=NA, oxygen_saturation=NA, systolic_BP=NA, diastolic_BP=NA, G6PD=NA,
+		pregnant=NA, creatinine=NA, study=NA, bicarbonate=NA, PCR=NA, sevemal=NA, bilirubin=NA, glucose=NA, bleeding_severity=NA)
+
+
+metadata <- metadata %>%
+	rbind(archived_data)
+
+# Basic Model
+Plink_fam <- read.table("cleaned_overlap.fam", sep =" ") %>% 
+	mutate(Sample = str_remove(V1, "_DK.*")) %>% 
+	mutate(Sample = ifelse(!grepl("PK_SB_DNA", Sample), str_replace(Sample, "_", "-"), Sample)) %>% 
+	left_join(metadata) %>% 
+	select(-Sample) %>%
+	select(1:5, sevemal) %>%
+	mutate(sevemal = ifelse(sevemal == "Sm", 1, 2))
+
+# updated fam file
+write.table(Plink_fam, "cleaned_overlap.fam", quote = FALSE, sep = " ", col.names = FALSE, row.names = FALSE)
+
+# Combine PCs as the covariate file
+# Use 5 PCs from each
+n_pc <- 5
+
+# Prepare expression PCs
+exp_pcs_trim <- read_tsv("fastlmm_expr_pcs_filtered.tsv") %>%
+	select(FID, IID, paste0("PC", 1:n_pc)) %>%
+	rename_with(~ paste0("exp_", .), starts_with("PC"))
+
+# Prepare genotype PCs (note: rename #FID to FID if needed)
+geno_pcs_trim <- read_tsv("cleaned_overlap.eigenvec") %>%
+	dplyr::rename(FID = `#FID`) %>%
+	select(FID, IID, paste0("PC", 1:n_pc)) %>%
+	rename_with(~ paste0("geno_", .), starts_with("PC"))
+
+# Match by overlap_samples: link FID/IID across formats
+combined_pcs <- read_tsv("overlapping_samples_index.tsv", col_names = FALSE) %>%
+	select(expr = X3, plink = X1) %>%
+	inner_join(exp_pcs_trim, by = c("expr" = "IID")) %>%
+	inner_join(geno_pcs_trim, by = c("plink" = "IID")) %>%
+	transmute(
+		FID = plink,
+		IID = plink,
+		across(starts_with("geno_")),
+		across(starts_with("exp_"))
+)
+
+# Save for FastLMM
+write_tsv(combined_pcs, "fastlmm_joint_covariates.tsv")
+```
+
+
+# 6. Run FastLMM eQTL Models (using Snakemake?)
+
+# FastLMM eQTL analysis
+	•	Use FastLMM for eQTL analysis.
+	•	One model per gene.
+	•	Use the expression matrix and genotype data.
+
+cd /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk
+snakemake --profile config/pbs-submission/ --keep-going --latency-wait 10 --snakefile Snakefile -n --printshellcmds
+
+
+To test:
+python scripts/run_fastlmm.py --pheno-gene TRINITY_DN27661_c0_g1 \
+	--expr-matrix /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/fastlmm_expression_matrix_filtered.tsv \
+	--covar /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/fastlmm_joint_covariates.tsv \
+	--plink-prefix /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/cleaned_overlap \
+	--out /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/results/eqtl_results/TRINITY_DN27661_c0_g1.tsv
+
+Rscript scripts/plot_fastlmm_results.R \
+	/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/results/eqtl_results/TRINITY_DN27661_c0_g1.tsv \
+	/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/cleaned_overlap.bim
+
+
+Pipeline found here: /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk 
+
+```{bash,eval=F}
+qsub snakemake_pipeline.pbs
+```
+
+## Snakefile - run from PBS job above
+
+```{python,eval=F}
+####################################### Snakefile #########################################
+
+# Load config
+configfile: "config/config.yaml"
+eqtl_dir = config["eqtl_dir"]
+
+# Dynamically extract gene list from expression matrix in eqtl_dir
+import pandas as pd
+genes = pd.read_csv(eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv", sep="\t", nrows=0).columns[2:].tolist()
+
+# Final outputs
+rule all:
+	input:
+		expand("{eqtl_dir}results/eqtl_results/sig_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/suggestive_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir)
+
+# Rule to generate Manhattan, QQ plots and stats for transcripts with hits
+rule plot_fastlmm:
+	input:
+		result = eqtl_dir + "results/eqtl_results/{gene}.tsv",
+		bim = eqtl_dir + "cleaned_overlap.bim"
+	output:
+		sig = eqtl_dir + "results/eqtl_results/sig_snps_{gene}.txt",
+		suggestive = eqtl_dir + "results/eqtl_results/suggestive_snps_{gene}.txt"
+	resources:
+		jobname = lambda wildcards: f"smk-plot-{wildcards.gene}",
+		ncpus = 2,
+		mem = "16GB",
+		walltime = "4:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		"""
+		Rscript scripts/plot_fastlmm_results.R {input.result} {input.bim}
+		"""
+
+# Main rule to run one eQTL model per gene
+rule run_fastlmm:
+	input:
+		expr = eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv",
+		covar = eqtl_dir + "fastlmm_joint_covariates.tsv",
+		bim = eqtl_dir + "cleaned_overlap.bim",
+		fam = eqtl_dir + "cleaned_overlap.fam",
+		bed = eqtl_dir + "cleaned_overlap.bed",
+		ld_bed = eqtl_dir + "cleaned_overlap_ld.bed"
+	output:
+		result = temp(eqtl_dir + "results/eqtl_results/{gene}.tsv")
+	params:
+		gene = "{gene}",
+		eqtl_dir = eqtl_dir
+	resources:
+		jobname = lambda wildcards: f"smk-fastlmm-{wildcards.gene}",
+		ncpus = 5,
+		mem = "40GB",
+		walltime = "4:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		"""
+		python scripts/run_fastlmm.py \
+			--pheno-gene {params.gene} \
+			--expr-matrix {input.expr} \
+			--ld-bed-covar {input.ld_bed} \
+			--covar {input.covar} \
+			--plink-prefix {params.eqtl_dir}cleaned_overlap \
+			--out {output.result}
+		"""
+```
+
+## Scripts used in pipeline
+
+## Modelling
+
+```{python,eval=F}
+#!/usr/bin/env python
+
+import argparse
+from fastlmm.association import single_snp
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--pheno-gene", required=True)
+parser.add_argument("--expr-matrix", required=True)
+parser.add_argument("--covar", required=True)
+parser.add_argument("--plink-prefix", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--ld-bed-covar", required=True)
+args = parser.parse_args()
+
+# Just extract the correct phenotype to a new file
+import pandas as pd
+
+# Read and filter pheno
+expr_df = pd.read_csv(args.expr_matrix, sep="\t")
+pheno_df = expr_df[["FID", "IID", args.pheno_gene]].dropna()
+pheno_df.columns = ["FID", "IID", "pheno"]
+pheno_path = args.out + ".pheno.tmp"
+pheno_df.to_csv(pheno_path, sep="\t", index=False, header=False)
+ld_bed_covar= args.ld_bed_covar
+
+# Run FastLMM
+results = single_snp(
+	test_snps=args.plink_prefix,
+	pheno=pheno_path,
+	covar=args.covar,
+	K0=ld_bed_covar,
+	count_A1=False  # suppress warning
+)
+
+results.to_csv(args.out, sep="\t", index=False)
+```
+
+## Plotting 
+
+```{R,eval=F}
+#!/usr/bin/env Rscript
+
+library(tidyverse)
+library(data.table)
+library(scales)
+library(QCEWAS)
+library(ggExtra)
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) != 2) stop("Usage: Rscript plot_fastlmm_results.R <result_tsv> <bim_file>")
+file_path <- args[1]
+bim_path <- args[2]
+
+# Parse gene ID
+gene_id_clean <- str_remove(basename(file_path), ".tsv") %>%
+  str_trim()  %>% 
+  str_squish()
+
+outdir <- dirname(file_path)
+
+# Load eQTL results
+gwasResults_all <- read_tsv(file_path) %>%
+  mutate(Chr = as.factor(Chr),
+		 SNP = str_remove(SNP, "ordered_PKNH_|new"),
+		 SNP = as.factor(SNP))
+
+# Load gene position table
+gene_pos <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/gene_positions.tsv") %>% 
+  mutate(trinity = str_trim(trinity) %>% str_squish())
+
+region <- gene_pos %>%
+ filter(trinity == gene_id_clean) %>%
+  mutate(start = pmax(start - 10000, 0),
+		 end = end + 10000)  # start can't be negative
+
+if (nrow(region) == 0) stop("Gene not found in gene_positions.tsv")
+
+chrom <- region$chr %>% 
+  str_remove("ordered_PKNH_") %>%
+  str_remove("_v2") %>%
+  str_remove("^0+") # match format in Chr column
+cis_start <- region$start
+cis_end <- region$end
+
+# Subset to window
+gwasResults <- gwasResults_all %>%
+  filter(Chr == chrom,
+		 ChrPos >= cis_start,
+		 ChrPos <= cis_end)
+
+# Bonferroni cutoff based only on cis-window SNP count
+n_snps <- nrow(gwasResults)
+p_cutoff <- 0.05 / n_snps
+suggestive_cutoff <- 1 / n_snps
+
+# Manhattan plot
+my_manhattan <- function(gwasResults_all) {
+  gwasResults_all %>%
+	mutate(Chr = as.factor(as.numeric(as.character(Chr)))) %>%
+	arrange(Chr, ChrPos) %>%
+	mutate(SNP = row_number(),
+		   logP = -log10(PValue),
+		   size = ifelse(logP > -log10(p_cutoff), rescale(logP, to = c(1.5, 5)), 1)) -> gwas
+
+  chr_labels <- gwas %>%
+	group_by(Chr) %>%
+	summarise(center = mean(SNP), .groups = "drop")
+
+  ggplot(gwas, aes(x = SNP, y = logP, colour = Chr, size = size)) +
+	geom_point() +
+	geom_hline(yintercept = -log10(p_cutoff), linetype = 2) +
+	geom_hline(yintercept = -log10(suggestive_cutoff), linetype = "dotted") +
+	scale_colour_viridis_d() +
+	scale_size_identity() +
+	scale_x_continuous(breaks = chr_labels$center, labels = chr_labels$Chr) +
+	labs(x = "Chromosome", y = expression(-log[10]("P-value"))) +
+	theme(axis.title = element_text(size = 16),
+		  axis.text = element_text(size = 14),
+		  legend.position = "none")
+}
+
+# QQ plot
+my_qq_plot <- function(gwasResults_all) {
+  pvector <- gwasResults_all %>%
+	filter(PValue > 0 & PValue < 1 & !is.na(PValue)) %>%
+	pull(PValue)
+
+  o <- -log10(sort(pvector))
+  e <- -log10(ppoints(length(pvector)))
+
+  tmp <- data.frame(e = e, o = o)
+
+  ggMarginal(
+	ggplot(tmp, aes(e, o)) +
+	  geom_point(color = "#1F968BFF") +
+	  geom_abline(color = "#440154FF") +
+	  xlab(expression(Expected ~ -log[10](italic(p)))) +
+	  ylab(expression(Observed ~ -log[10](italic(p)))) +
+	  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14)),
+	type = "histogram", bins = 50
+  )
+}
+
+# Lambda
+my_lambda <- function(gwasResults_all) {
+  gwasResults_all %>% 
+	select(PValue) %>% 
+	drop_na() %>% 
+	pull() %>% 
+	P_lambda()
+}
+
+
+# Save significant/suggestive results (always write, even if empty)
+sig_hits <- gwasResults %>%
+  filter(PValue < p_cutoff)
+
+sug_hits <- gwasResults %>%
+  filter(PValue < suggestive_cutoff)
+
+# Check if there's at least one significant SNP
+has_hits <- any(gwasResults$PValue < p_cutoff)
+
+# Only generate plots and lambda if there are hits
+if (has_hits) {
+  ggsave(file.path(outdir, paste0("manhattan_", gene_id_clean, ".png")),
+		 my_manhattan(gwasResults_all), dpi = 300, width = 20)
+
+  ggsave(file.path(outdir, paste0("qq_", gene_id_clean, ".png")),
+		 my_qq_plot(gwasResults_all), dpi = 300)
+
+  write.table(my_lambda(gwasResults_all),
+			  file.path(outdir, paste0("lambda_", gene_id_clean, ".txt")),
+			  col.names = FALSE, sep = "\t", quote = FALSE)
+}
+
+sig_hits %>%
+  write_tsv(file.path(outdir, paste0("sig_snps_", gene_id_clean, ".txt")))
+sug_hits %>%
+	write_tsv(file.path(outdir, paste0("suggestive_snps_", gene_id_clean, ".txt")))    
+```
+
+
+# 7. Replicate for DE genes that **do not overlap with A1H1 genes**
+	•	Use the same expression matrix and covariate file.
+	•	Filter for DE genes that do not overlap with A1H1 genes.
+	•	Run FastLMM for these genes as a **trans-eQTL** analysis.
+
+# Generate gene position data for target transcripts
+	•	Use A1H1 annotation to map transcripts to genes.
+	•	Generate a BED file with gene coordinates and transcript names.
+
+```{R,eval=F}
+# Load required libraries
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+library(limma)
+
+# Read in data for genes of interest
+## Already analysed A1H1 genes
+a1h1_genes <- read_tsv("fastlmm_expression_matrix_filtered_a1h1.tsv") %>% 
+	select(-c(FID, IID)) %>%
+	colnames()
+
+# Read on filtered DE genes
+de_genes <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/significant_overlap_with_nonzero_counts_30_cutoff.tsv") %>%
+	filter(!gene %in% a1h1_genes) %>%
+	pull(gene)
+
+# Convert to logCPM
+
+## Load SummarizedExperiment
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+counts <- round(assay(se))
+meta <- colData(se)
+
+# Subset count matrix to target genes
+counts_de <- counts[rownames(counts) %in% de_genes, ]
+
+# Convert to logCPM
+logcpm_de <- cpm(counts_de, log = TRUE, prior.count = 1)
+
+# Reformat expression matrix: samples as rows, genes as columns
+expr_df <- as.data.frame(t(logcpm_de)) %>%
+	rownames_to_column("IID") %>%
+	mutate(FID = IID) %>%
+	select(FID, IID, everything())
+
+# Save expression matrix
+write_tsv(expr_df, "fastlmm_expression_matrix_trans.tsv")
+```
+
+## Filter expression data for overlapping samples
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+
+# Load overlapping samples
+overlap_samples <- read_tsv("overlapping_samples_index.tsv")
+
+# Define ordered PLINK sample IDs
+ordered_ids <- overlap_samples %>%
+  select(IID = plink) %>%
+  pull()
+
+# Filter and save expression matrix
+overlap_samples %>%
+	select(expr, plink) %>%
+	left_join(
+		read_tsv("fastlmm_expression_matrix_trans.tsv") %>%
+			dplyr::rename(expr = IID)
+	) %>%
+	select(-expr) %>%
+	dplyr::rename(IID = plink) %>%
+	mutate(FID = IID) %>%
+	arrange(factor(IID, levels = ordered_ids)) %>%
+	write_tsv("fastlmm_expression_matrix_filtered_trans.tsv")
+```
+
+## Run smk pipeline for other DE genes
+
+**IMPORTANT**: Make sure to update the `Snakefile` to include the new trans-eQTL genes and their expression matrix.
+	- results/eqtl_results > results/eqtl_results_trans (Snakefile)
+	- fastlmm_expression_matrix_filtered_a1h1.tsv > fastlmm_expression_matrix_filtered_a1h1_trans.tsv (Snakefile)
+	- change rule to trans (Snakefile)
+**IMPORTANT**: Make sure to return to the original 'Snakefile'.
+
+Pipeline found here: /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk 
+
+```{bash,eval=F}
+qsub snakemake_pipeline.pbs
+```
+
+
+
+# 8. Replicate for **genes of interest** from targeted analyses
+
+
+## Generated expression data for genes of interest
+
+```{R,eval=F}
+# Load required libraries
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+library(limma)
+
+# Read in data for genes of interest
+path = "/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/targeted_analysis"
+
+heat <- read_tsv(file.path(path, "heat_transcripts.tsv")) %>% 
+	select(gene = 1)
+sicavar <- read_tsv(file.path(path, "sicavar_transcripts.tsv")) %>%
+	select(1)
+kir <- read_tsv(file.path(path, "kir_transcripts.tsv")) %>%
+	select(1)
+gametocyte <- read_tsv(file.path(path, "gametocyte_transcripts_combined.tsv")) %>%
+	select(gene = 2)
+moon <- read_tsv(file.path(path, "rob_moon_transcripts.tsv")) %>%
+	select(gene = 2)
+
+target_genes <- heat %>%
+	rbind(sicavar) %>%
+	rbind(kir) %>%
+	rbind(gametocyte) %>%
+	rbind(moon) %>%
+	distinct() %>%
+	pull(gene)
+
+## Load SummarizedExperiment
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+counts <- round(assay(se))
+meta <- colData(se)
+
+# Subset count matrix to target genes
+counts_de <- counts[rownames(counts) %in% target_genes, ]
+
+# Convert to logCPM
+logcpm_de <- cpm(counts_de, log = TRUE, prior.count = 1)
+
+# Reformat expression matrix: samples as rows, genes as columns
+expr_df <- as.data.frame(t(logcpm_de)) %>%
+	rownames_to_column("IID") %>%
+	mutate(FID = IID) %>%
+	select(FID, IID, everything())
+
+# Save expression matrix
+write_tsv(expr_df, "fastlmm_expression_matrix_targeted.tsv")
+```
+
+## Filter expression data for overlapping samples
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+
+# Load overlapping samples
+overlap_samples <- read_tsv("overlapping_samples_index.tsv")
+
+# Define ordered PLINK sample IDs
+ordered_ids <- overlap_samples %>%
+  select(IID = plink) %>%
+  pull()
+
+# Filter and save expression matrix
+overlap_samples %>%
+	select(expr, plink) %>%
+	left_join(
+		read_tsv("fastlmm_expression_matrix_targeted.tsv") %>%
+			dplyr::rename(expr = IID)
+	) %>%
+	select(-expr) %>%
+	dplyr::rename(IID = plink) %>%
+	mutate(FID = IID) %>%
+	arrange(factor(IID, levels = ordered_ids)) %>%
+	write_tsv("fastlmm_expression_matrix_filtered_targeted.tsv")
+```
+
+## Generate gene position data for target transcripts
+	•	Use A1H1 annotation to map transcripts to genes.
+	•	Generate a BED file with gene coordinates and transcript names.
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+
+# 'Map' transcript to gene using A1H1 annotation
+## A1H1 Map
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+	col_names = FALSE, 
+	comment = "#")
+
+colnames(tracking)[c(1, 3, 5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+		a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+		trinity = str_remove(trinity, "\\.path1.*"),
+		trinity = str_remove(trinity, "_i..*")) %>%
+	na.omit() %>%
+	unique()
+
+# Read expression data for target transcripts
+expr_ids <- read_tsv("fastlmm_expression_matrix_filtered_targeted.tsv") %>%
+	select(-c(FID, IID)) %>%
+	colnames()
+
+a1h1_map <- filter(a1h1_map, trinity %in% expr_ids)
+
+# Load only 'gene' entries from the GFF using readr
+gene_coords <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-68_PknowlesiA1H1.gff", comment = "#", col_names = FALSE) %>%
+	filter(X3 == "mRNA") %>%
+	transmute(
+		chr = X1,
+		start = X4,
+		end = X5,
+		gene_id = str_extract(X9, "Parent=([^;]+)") %>% str_remove("Parent=")
+	) %>%
+	distinct()
+
+# Combine gene coordinates with A1H1 map
+gene_coords <- gene_coords %>%
+	inner_join(a1h1_map, by = c("gene_id" = "a1h1"))
+
+# Correct chromosome names (genotype data used LSHTM annotation)
+# Build chromosome mapping table by order - PlasmoDB vs LSHTM
+chr_map <- tibble(
+	chr = paste0("LT7276", 48:99),  # GFF contigs (expression side)
+	new_chr = paste0("ordered_PKNH_", str_pad(1:(99 - 48 + 1), 2, pad = "0"), "_v2")
+)
+
+# Apply the mapping to the expression dataframe
+gene_coords_with_chr <- gene_coords %>%
+	left_join(chr_map, by = "chr") %>%
+	mutate(chr = new_chr) %>%
+	select(-new_chr) %>%
+	filter(chr != "ordered_PKNH_15_v2" & chr != "ordered_PKNH_16_v2")  %>% # Remove non-standard chromosomes
+	mutate(chr_plink = str_remove(chr, "_v2"), chr_plink = str_remove(chr_plink, "ordered_PKNH_")) %>%
+	mutate(chr_plink = as.numeric(chr_plink))
+
+write_tsv(gene_coords_with_chr, "gene_positions_targeted.tsv")
+
+# Subset expression data genes that we have coordinates for (ie. overlapping with a1h1_map)
+read_tsv("fastlmm_expression_matrix_filtered_targeted.tsv") %>%
+	select(FID, IID, all_of(intersect(colnames(.), gene_coords_with_chr$trinity))) %>%
+	write_tsv("fastlmm_expression_matrix_filtered_a1h1_targeted.tsv")
+```
+
+## Run smk pipeline for targeted genes
+
+**IMPORTANT**: Make sure to update the `Snakefile` to include the new targeted genes and their expression matrix.
+	- results/eqtl_results > results/eqtl_results_targeted (Snakefile)
+	- fastlmm_expression_matrix_filtered_a1h1.tsv > fastlmm_expression_matrix_filtered_a1h1_targeted.tsv (Snakefile)
+	- gene_positions.tsv > gene_positions_targeted.tsv (R script)
+	- change rule to cis and add window (Snakefile)
+**IMPORTANT**: Make sure to return to the original 'Snakefile'.
+
+Pipeline found here: /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk 
+
+```{bash,eval=F}
+qsub snakemake_pipeline.pbs
+```
+
+## Move data with no significant/suggestive hits to a separate folder - delete?
+
+```{bash,eval=F}
+find . -maxdepth 1 -type f -name "sig*" -exec sh -c '
+  for f; do
+	if [ "$(wc -l < "$f")" -gt 1 ]; then
+	  cat "$f"
+	fi
+  done
+' sh {} +
+
+find . -name "sig_snps_*.txt" -type f | while read file; do
+  if [ $(wc -l < "$file") -le 1 ]; then
+	mv "$file" no_sig/
+  fi
+done
+
+find . -name "suggestive_snps_*.txt" -type f | while read file; do
+  if [ $(wc -l < "$file") -le 1 ]; then
+	mv "$file" no_sig/
+  fi
+done
+```
+
+
+# 9. SNP focused analysis
+
+	•	Get SNP locations from GWAS models.
+	•	Get gene positions for target transcripts (within 10kb of SNPs).
+	•	Use map to subset expression data to these transcripts (A1H1 > Trinity).
+	•	Run fatLMM models for these transcripts.
+	•	After model fitting, filter results to the SNP(s) that were used to anchor the transcript (e.g. the GWAS hit ± buffer).
+	•	Correct p-values based on the number of SNPs tested within that window, not genome-wide.
+
+## Generate gene position data for target transcripts and filter expression data
+	•	Use A1H1 annotation to map transcripts to genes.
+	•	Generate a BED file with gene coordinates and transcript names.
+	•	Generate a file linking SNPs and transcripts.
+
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+
+para_gwas <- read_tsv("/g/data/pq84/malaria/warpedLMM/warpedLMM/data/warpedlmm_updated_framework/geno_10/MAF_5/testing_k0_ld_covar/suggestive_snps_testing_k0_ld_covar.txt")  %>%
+	select(Chr, ChrPos) 
+
+sev_gwas <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/fastlmm_updated_framework/geno_5/MAF_5/suggestive_snps_testing_K0_ld.txt") %>%
+	select(Chr) %>%
+	separate(Chr, into = c("Chr", "ChrPos", "ref", "alt", "id"), sep = ":") %>%
+	select(Chr, ChrPos) %>%
+	mutate(Chr = as.numeric(str_remove(Chr, "_v2")), ChrPos = as.numeric(ChrPos))
+	
+snps <- para_gwas %>%
+	rbind(sev_gwas) %>%
+	mutate(start = ChrPos - 10000, end = ChrPos + 10000) %>%
+	unique()
+
+
+# 'Map' transcript to gene using A1H1 annotation
+## A1H1 Map
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+	col_names = FALSE, 
+	comment = "#")
+
+colnames(tracking)[c(1, 3, 5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+		a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+		trinity = str_remove(trinity, "\\.path1.*"),
+		trinity = str_remove(trinity, "_i..*")) %>%
+	na.omit() %>%
+	unique()
+
+# Load only 'gene' entries from the GFF using readr
+gene_coords <- read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/fasta/PlasmoDB_version/PlasmoDB-68_PknowlesiA1H1.gff", comment = "#", col_names = FALSE) %>%
+	filter(X3 == "mRNA") %>%
+	transmute(
+		chr = X1,
+		start = X4,
+		end = X5,
+		gene_id = str_extract(X9, "Parent=([^;]+)") %>% str_remove("Parent=")
+	) %>%
+	distinct()
+
+# Combine gene coordinates with A1H1 map
+gene_coords <- gene_coords %>%
+	inner_join(a1h1_map, by = c("gene_id" = "a1h1"))
+
+# Correct chromosome names (genotype data used LSHTM annotation)
+# Build chromosome mapping table by order - PlasmoDB vs LSHTM
+# Step 1: Apply chr_map to gene_coords
+chr_map <- tibble(
+	chr = paste0("LT7276", 48:99),
+	Chr = 1:(99 - 48 + 1)  # numeric 1 to 52
+)
+
+gene_coords_mapped <- gene_coords %>%
+	left_join(chr_map, by = "chr") %>%
+	filter(!is.na(Chr)) %>%  # Only keep standard chromosomes
+	filter(Chr <= 14)      # Match range used in SNP data
+
+genes_near_snps <- gene_coords_mapped %>%
+  inner_join(snps, by = "Chr") %>%
+  filter(start.x <= end.y & end.x >= start.y) %>%
+  transmute(
+	chr = chr,
+	gene_start = start.x,
+	gene_end = end.x,
+	gene_id = gene_id,
+	trinity = trinity,
+	Chr = Chr,
+	snp_pos = ChrPos
+  ) %>%
+  distinct()
+
+## Load SummarizedExperiment
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+counts <- round(assay(se))
+meta <- colData(se)
+
+# Subset count matrix to DE genes
+gwas_genes <- genes_near_snps %>%
+	pull(trinity)
+
+counts_de <- counts[rownames(counts) %in% gwas_genes, ]
+
+# Convert to logCPM
+logcpm_de <- cpm(counts_de, log = TRUE, prior.count = 1)
+
+# Reformat expression matrix: samples as rows, genes as columns
+expr_df <- as.data.frame(t(logcpm_de)) %>%
+	rownames_to_column("IID") %>%
+	mutate(FID = IID) %>%
+	select(FID, IID, everything())
+
+# Filter for sample overlap with genotype data
+
+# Load overlapping samples
+overlap_samples <- read_tsv("overlapping_samples_index.tsv")
+
+# Define ordered PLINK sample IDs
+ordered_ids <- overlap_samples %>%
+  select(IID = plink) %>%
+  pull()
+
+# Filter and save expression matrix
+filtererd_expr <- overlap_samples %>%
+	select(expr, plink) %>%
+	left_join(
+		expr_df %>%
+			dplyr::rename(expr = IID)
+	) %>%
+	select(-expr) %>%
+	dplyr::rename(IID = plink) %>%
+	mutate(FID = IID) %>%
+	arrange(factor(IID, levels = ordered_ids))
+
+write_tsv(filtererd_expr, "fastlmm_expression_matrix_filtered_a1h1_gwas.tsv")
+
+# Generate gene position data for target transcripts
+genes_near_snps %>%
+	filter(trinity %in% colnames(filtererd_expr)) %>% 
+	select(chr, snp_pos, trinity, gene_id) %>%
+	write_tsv("gene_positions_gwas.tsv")
+```
+
+
+## Run smk pipeline for SNP centric genes
+
+**IMPORTANT**: Make sure to update the `Snakefile` to include the new targeted genes and their expression matrix.
+	- results/eqtl_results > results/eqtl_results_gwas
+	- fastlmm_expression_matrix_filtered_a1h1.tsv > fastlmm_expression_matrix_filtered_a1h1_gwas.tsv
+	- gene_positions.tsv > gene_positions_gwas.tsv (R script)
+**IMPORTANT**: Make sure to return to the original 'Snakefile'.
+
+Pipeline found here: /g/data/pq84/malaria/Pk_trancsriptomics/scripts/eqtl_smk_snps
+
+```{bash,eval=F}
+qsub snakemake_pipeline.pbs
+```
+
+## Subset fastLMM output table to SNPs of interest - GWAS hits for the given gene tested
+
+
+
+# 10. Summaries & visualisation - combining sig hits from eQTL and GWAS - repeated for all above
+	•	Combine all eQTL signal
+	•	Combine with GWAS hits
+	•	Optionally combine:
+	•	Upper track: GWAS signal (PC1/2 or phenotype)
+	•	Lower track: eQTL hits for gene of interest.
+
+Use qqman in R, or pyManhattan, or ggplot2.
+
+Consider comparing GWAS hits to eQTLs for colocalization (e.g., for PfRAD5 or PfWD11).
+
+/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/eqtl/results/eqtl_results
+
+
+```{R,eval=F}
+library(tidyverse)
+library(readr)
+library(stringr)
+library(purrr)
+library(tidyr)
+
+# Extract transcript ID
+get_transcript_id <- function(path, prefix) {
+	basename(path) %>%
+		str_remove(paste0("^", prefix, "_")) %>%
+		str_remove("\\.txt$")
+}
+
+# Read one directory of eQTL results
+read_eqtl_dir <- function(dir_path) {
+	# Find files
+	lambda_files     <- list.files(dir_path, pattern = "^lambda_.*\\.txt$", full.names = TRUE)
+	sig_files        <- list.files(dir_path, pattern = "^sig_snps_.*\\.txt$", full.names = TRUE)
+	suggestive_files <- list.files(dir_path, pattern = "^suggestive_snps_.*\\.txt$", full.names = TRUE)
+
+	# Lambdas
+	lambda_df <- if (length(lambda_files)) {
+		set_names(lambda_files, map_chr(lambda_files, get_transcript_id, prefix = "lambda")) %>%
+		map_dfr(~ read_tsv(.x, col_names = c("tmp", "lambda"), show_col_types = FALSE),
+				.id = "transcript_id") %>%
+		select(-tmp)
+	} else {
+		tibble(transcript_id = character(), lambda = numeric())
+	}
+
+	# Significant SNPs (ALL rows)
+	sig_df <- if (length(sig_files)) {
+		sig_ids <- map_chr(sig_files, get_transcript_id, prefix = "sig_snps")
+		set_names(sig_files, sig_ids) %>%
+		# keep only non-empty files (more than header line)
+		keep(~ file.exists(.x) && length(read_lines(.x)) > 1) %>%
+		map_dfr(
+			~ {
+			df <- read_tsv(.x, show_col_types = FALSE)
+			# keep only needed cols if present
+			df %>% select(any_of(c("SNP","PValue")))
+			},
+			.id = "transcript_id"
+		) %>%
+		mutate(class = "sig") %>%
+		arrange(transcript_id, PValue) %>%
+		# ensure we still include transcripts that had a file but no rows
+		complete(transcript_id = sig_ids, fill = list(SNP = NA_character_, PValue = NA_real_, class = "sig"))
+	} else {
+		tibble(transcript_id = character(), SNP = character(), PValue = numeric(), class = character())
+	}
+
+	# Suggestive SNPs (ALL rows)
+	suggestive_df <- if (length(suggestive_files)) {
+		sugg_ids <- map_chr(suggestive_files, get_transcript_id, prefix = "suggestive_snps")
+		set_names(suggestive_files, sugg_ids) %>%
+		keep(~ file.exists(.x) && length(read_lines(.x)) > 1) %>%
+		map_dfr(
+			~ {
+			df <- read_tsv(.x, show_col_types = FALSE)
+			df %>% select(any_of(c("SNP","PValue")))
+			},
+			.id = "transcript_id"
+		) %>%
+		mutate(class = "sugg") %>%
+		arrange(transcript_id, PValue) %>%
+		complete(transcript_id = sugg_ids, fill = list(SNP = NA_character_, PValue = NA_real_, class = "sugg"))
+	} else {
+		tibble(transcript_id = character(), SNP = character(), PValue = numeric(), class = character())
+	}
+
+	# Long table with ALL hits (sig + sugg)
+	all_hits_long <- bind_rows(sig_df, suggestive_df) %>%
+		# If there are *no* hits at all, keep structure
+		mutate(class = factor(class, levels = c("sig","sugg"))) %>%
+		# join lambda in (per transcript)
+		left_join(lambda_df, by = "transcript_id") %>%
+		select(transcript_id, lambda, class, SNP, PValue)
+
+	# Wide summary with counts and best P per class per transcript
+	per_transcript_summary <- all_hits_long %>%
+		group_by(transcript_id, lambda, class) %>%
+		summarise(
+		n_hits = sum(!is.na(SNP)),
+		best_P = suppressWarnings(min(PValue, na.rm = TRUE)),
+		.groups = "drop"
+		) %>%
+		mutate(best_P = ifelse(is.infinite(best_P), NA_real_, best_P)) %>%
+		pivot_wider(
+		names_from = class,
+		values_from = c(n_hits, best_P),
+		names_sep = "."
+		)
+
+	list(
+		lambda_df          = lambda_df,
+		sig_df_all         = sig_df %>% filter(!is.na(SNP)),       # all significant SNP rows
+		suggestive_df_all  = suggestive_df %>% filter(!is.na(SNP)),# all suggestive SNP rows
+		all_hits_long      = all_hits_long,                        # combined long table
+		per_transcript_summary = per_transcript_summary            # optional wide summary per transcript
+	)
+}
+
+# Run for each directory
+base <- "results"
+
+dirs <- list(
+	gwas      = file.path(base, "eqtl_results_gwas"),
+	targeted  = file.path(base, "eqtl_results_targeted"),
+	de_trans  = file.path(base, "eqtl_results_trans"),
+	de_cis    = file.path(base, "eqtl_results")  # cis
+)
+
+out <- dirs %>% map(read_eqtl_dir)
+
+# Examples:
+# out$gwas$all_hits_long
+# out$gwas$sig_df_all
+# out$gwas$suggestive_df_all
+# out$gwas$per_transcript_summary
+
+# Add annotations for DE-cenric analysis
+de_ano <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/nonzero_counts_30_ruv/significant_genes_description_combined_brief.tsv") %>%
+	dplyr::rename(transcript_id = gene) 
+
+# Cis-eQTL results
+## Note: the cis-eQTL analysis is already focused on a 10kb window with adjustments made accordingly.
+de_cis <- out$de_cis$all_hits_long %>%
+	na.omit() %>% 
+	filter(lambda >= 0.95, lambda <= 1.05) %>% # only keep reliable models
+	left_join(
+		de_ano, 
+		by = "transcript_id"
+	) %>%
+	mutate(class = forcats::fct_relevel(class, "sig", "sugg")) %>%
+	arrange(transcript_id, SNP, class, PValue) %>%          # puts 'sig' before 'sugg'
+	distinct(transcript_id, SNP, .keep_all = TRUE) %>%      # keep first (= sig) - only keep one SNP per transcript
+	arrange(PValue) %>%
+	add_column(analysis = "cis-eQTL")
+
+write_tsv(de_cis, "results/cis_eqtl_results.tsv")
+
+##################################################################
+
+# Trans-eQTL results
+## For the trans-eQTL analysis, we will filter to the most significant SNP per transcript within a defined window around the lead SNP.
+## The adjusted P-value for each model is already adjusted for the number of SNPs tested in that model, but this adds another layer of confidence.
+# Define your window size
+window_bp <- 500
+
+de_trans <- out$de_trans$all_hits_long %>%
+	na.omit() %>% 
+	mutate(transcript_id = str_remove(transcript_id, "_$")) %>% 
+	filter(lambda >= 0.95, lambda <= 1.05) %>% 
+	left_join(
+		de_ano, 
+		by = "transcript_id"
+	) %>%
+	mutate(class = forcats::fct_relevel(class, "sig", "sugg")) %>%
+	arrange(transcript_id, SNP, class, PValue) %>%
+	distinct(transcript_id, SNP, .keep_all = TRUE) %>%
+	# Extract chr and pos from SNP
+	separate(SNP, into = c("chr", "pos", "ref", "alt", "extra"), sep = ":", remove = FALSE) %>%
+	mutate(
+		chr = str_remove(chr, "_v2"),
+		pos = as.numeric(pos)
+	) %>%
+	# Find lead SNP per transcript
+	group_by(transcript_id) %>%
+	mutate(
+		lead_idx = which.min(PValue),
+		lead_chr = chr[lead_idx],
+		lead_pos = pos[lead_idx]
+	) %>%
+	# Keep only SNPs within window on same chr as lead SNP
+	filter(chr == lead_chr & abs(pos - lead_pos) <= window_bp) %>%
+	ungroup() %>%
+	
+	arrange(PValue) %>%
+	add_column(analysis = "trans-eQTL") %>%
+	select(-c(lead_idx, lead_chr, lead_pos))
+
+# Sensitivity analysis
+
+# Define the window sizes to test
+sensitivity_windows <- c(0, 250, 500, 1000)
+
+# Function to apply your Option A logic for a given window size
+refine_trans_single_lead <- function(df, window_bp) {
+	df %>%
+		na.omit() %>%
+		mutate(transcript_id = str_remove(transcript_id, "_$")) %>%
+		filter(lambda >= 0.95, lambda <= 1.05) %>%
+		left_join(de_ano, by = "transcript_id") %>%
+		mutate(class = forcats::fct_relevel(class, "sig", "sugg")) %>%
+		arrange(transcript_id, SNP, class, PValue) %>%
+		distinct(transcript_id, SNP, .keep_all = TRUE) %>%
+		separate(SNP, into = c("chr", "pos", "ref", "alt", "extra"),
+				sep = ":", remove = FALSE) %>%
+		mutate(chr = str_remove(chr, "_v2"),
+			pos = as.numeric(pos)) %>%
+		group_by(transcript_id) %>%
+		mutate(
+		lead_idx = which.min(PValue),
+		lead_chr = chr[lead_idx],
+		lead_pos = pos[lead_idx]
+		) %>%
+		filter(chr == lead_chr & abs(pos - lead_pos) <= window_bp) %>%
+		ungroup() %>%
+		arrange(PValue) %>%
+		add_column(analysis = "trans-eQTL", .before = 1) %>%
+		select(-lead_idx, -lead_chr, -lead_pos)
+}
+
+# Run the refinement for each window size and summarise counts
+sensitivity_summary <- map_dfr(
+	sensitivity_windows,
+	function(w) {
+		refined <- refine_trans_single_lead(out$de_trans$all_hits_long, window_bp = w)
+		tibble(
+		window_bp = w,
+		n_transcripts = n_distinct(refined$transcript_id),
+		n_snps_total  = nrow(refined)
+		)
+	}
+)
+
+# View the sensitivity table
+print(sensitivity_summary)
+
+write_tsv(sensitivity_summary, "results/trans_eqtl_window_sensitivity.tsv")
+
+
+##################################################################
+
+# GWAS-centric results
+
+# 0) Build a stable ONE-TO-ONE transcript annotation (Trinity -> A1H1 gene -> product)
+#    If you already computed `a1h1_map` earlier, reuse it here. Otherwise:
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking",
+					col_names = FALSE, comment = "#")
+colnames(tracking)[c(1,3,5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+			a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+			trinity = str_remove(trinity, "\\.path1.*"),
+			trinity = str_remove(trinity, "_i..*")) %>%
+	distinct(trinity, a1h1, .keep_all = TRUE)
+
+# Read GFF once and get product (same as you had)
+genes <- read_tsv(
+	"/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz",
+	comment = "#", col_names = FALSE
+	) %>%
+	filter(X3 == "gene") %>%
+	transmute(gene_id = str_extract(X9, "(?<=ID=)[^;]+"))
+
+products <- read_tsv(
+	"/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/data/ref_genomes/PKA1H1/gff/strain_A1_H.1.Icor.gff3.gz",
+	comment = "#", col_names = FALSE
+	) %>%
+	filter(X3 == "polypeptide") %>%
+	transmute(
+		derives_from = str_extract(X9, "(?<=Derives_from=)[^;]+"),
+		product = URLdecode(str_match(X9, "product=([^;]+)")[,2])
+	) %>%
+	mutate(gene_id = str_remove(derives_from, "\\.1$")) %>%
+	select(gene_id, product)
+
+gff <- genes %>% left_join(products, by = "gene_id")
+
+# Primary annotation map: ONE ROW per transcript_id
+tx_annotation <- a1h1_map %>%
+	rename(transcript_id = trinity, gene_id = a1h1) %>%
+	left_join(gff, by = "gene_id") %>%
+	mutate(description = product %>% replace_na("") %>% str_remove("term=") %>% str_remove(";.*")) %>%
+	select(transcript_id, gene_id, description) %>%
+	distinct(transcript_id, .keep_all = TRUE)
+# Note: transcripts without A1H1 mapping will have NA gene_id/description (expected for some trans)
+
+# 1) Build a separate PROVENANCE table from the GWAS-driven selection
+#    (multiple GWAS genes/leads can map to the same transcript)
+prov_pairs <- read_tsv("gene_positions_gwas.tsv", show_col_types = FALSE) %>%
+	rename(transcript_id = trinity) %>%
+	select(transcript_id, gene_id, snp_pos, chr) %>%
+	distinct()
+
+# Collapse provenance per transcript to keep one row on join
+tx_provenance <- prov_pairs %>%
+	group_by(transcript_id) %>%
+	summarise(
+		gwas_gene_ids = paste(sort(unique(gene_id[!is.na(gene_id)])), collapse = ";"),
+		gwas_leads    = paste0(chr, ":", snp_pos, collapse = ";"),
+		.groups = "drop"
+	)
+
+# 2) Your GWAS-centric eQTL table (one row per transcript+SNP), now with annotation + provenance
+gwas_long <- out$gwas$all_hits_long %>%
+	drop_na() %>%
+	mutate(
+		transcript_id = str_remove(transcript_id, "_$"),
+		class = forcats::fct_relevel(class, "sig", "sugg")
+	) %>%
+	filter(lambda >= 0.95, lambda <= 1.05) %>%
+	arrange(transcript_id, SNP, class, PValue) %>%
+	distinct(transcript_id, SNP, .keep_all = TRUE) %>%   # one hit per transcript+SNP
+	left_join(tx_annotation, by = "transcript_id") %>%   # ONE-TO-ONE annotation
+	left_join(tx_provenance, by = "transcript_id")       # MANY-TO-ONE provenance (collapsed)
+
+write_tsv(gwas_long, "results/eqtl_results_gwas_long.tsv")
+
+##################################################################
+
+#Canonical columns we'll keep everywhere
+canon_cols <- c("transcript_id","analysis","class","PValue","lambda","SNP",
+				"description","description_source")
+
+# Ensure class ordering (sig first), and no duplicate (tx,SNP)
+normalize_tbl <- function(df, analysis_label = NULL) {
+	out <- df %>%
+		mutate(class = forcats::fct_relevel(as.factor(class), "sig","sugg")) %>%
+		arrange(transcript_id, SNP, class, PValue) %>%
+		distinct(transcript_id, SNP, .keep_all = TRUE)
+	if (!is.null(analysis_label)) {
+		out <- out %>% mutate(analysis = analysis_label)
+	}
+	# keep only canonical columns that exist
+	out %>% mutate(across(any_of(c("description","description_source")), ~ .x)) %>%
+		select(any_of(canon_cols))
+}
+
+# Normalise the three inputs
+# Assumes you already created: de_cis, de_trans, gwas_long
+
+cis_tbl <- normalize_tbl(de_cis,   analysis_label = "cis-eQTL")
+trans_tbl <- normalize_tbl(de_trans, analysis_label = "trans-eQTL")
+
+gwas_tbl <- gwas_long %>%
+	mutate(description_source = "PKA1H1") %>%     # make the column explicit
+	normalize_tbl(analysis_label = "gwas")
+
+# Supplementary: cis + trans (ALL hits sorted by P)
+cis_trans_all <- bind_rows(cis_tbl, trans_tbl) %>%
+	arrange(PValue)
+
+write_tsv(cis_trans_all, "results/eqtl_results_cis_trans_all.tsv")
+
+# Main text: top-10 snps of each (cis, trans, gwas)
+top10_cis   <- cis_tbl  %>% slice_min(PValue, n = 10, with_ties = FALSE)
+top10_trans <- trans_tbl %>% slice_min(PValue, n = 10, with_ties = FALSE)
+top10_gwas  <- gwas_tbl %>% slice_min(PValue, n = 10, with_ties = FALSE)
+
+combined_top30 <- bind_rows(top10_cis, top10_trans, top10_gwas) %>%
+	arrange(match(analysis, c("cis-eQTL","trans-eQTL","gwas")), PValue)
+
+write_tsv(combined_top30, "results/eqtl_results_top10_snps_per_analysis.tsv")
+
+# Option 2 - top-10 trancsripts per analysis
+# Helper: top-N targets per analysis (collapse SNPs -> lead per transcript)
+top_targets <- function(df, top_n = 10) {
+	# count SNPs per transcript (within this analysis)
+	counts <- df %>%
+		count(transcript_id, name = "n_snps")
+	# pick the lead SNP row per transcript (lowest P)
+	leads <- df %>%
+		group_by(transcript_id) %>%
+		arrange(PValue, .by_group = TRUE) %>%
+		slice(1) %>%
+		ungroup() %>%
+		# keep only the columns we want to display, rename for clarity
+		transmute(
+		transcript_id,
+		description = coalesce(description, NA_character_),
+		lambda,
+		lead_SNP = SNP,
+		lead_PValue = PValue,
+		lead_class = as.character(class),
+		analysis
+		) %>%
+		left_join(counts, by = "transcript_id") %>%
+		arrange(lead_PValue) %>%
+		slice_head(n = top_n)
+	leads
+}
+
+top10_cis_targets   <- top_targets(cis_tbl,   top_n = 10)
+top10_trans_targets <- top_targets(trans_tbl, top_n = 10)
+top10_gwas_targets  <- top_targets(gwas_tbl,  top_n = 10)
+
+top30_targets <- bind_rows(top10_cis_targets, top10_trans_targets, top10_gwas_targets) %>%
+	mutate(analysis = factor(analysis, levels = c("cis-eQTL","trans-eQTL","gwas"))) %>%
+	arrange(analysis, lead_PValue)
+
+write_tsv(top30_targets, "results/eqtl_top10_targets_per_analysis.tsv")
+
+# Transcripts with multiple SNP hits (per analysis)
+multi_snp_summary <- bind_rows(cis_tbl, trans_tbl, gwas_tbl) %>%
+	group_by(analysis, transcript_id, description) %>%
+	summarise(n_snps = n_distinct(SNP), .groups = "drop") %>%
+	filter(n_snps > 1) %>%
+	arrange(desc(n_snps), analysis, transcript_id)
+
+write_tsv(multi_snp_summary, "results/eqtl_transcripts_with_multiple_snps.tsv")
+
+# Quick sanity prints
+message("Rows: cis=", nrow(cis_tbl),
+        "  trans=", nrow(trans_tbl),
+        "  gwas=", nrow(gwas_tbl))
+
+# Do any results have "Perfect" overlap with GWAS SNPs
+gwas_results <- read_tsv("/g/data/pq84/malaria/warpedLMM/warpedLMM/data/warpedlmm_updated_framework/geno_10/MAF_5/testing_k0_ld_covar/suggestive_snps_testing_k0_ld_covar.txt")  %>%
+	select(Chr, ChrPos) %>%
+	rbind(
+		read_tsv("/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/fastlmm_updated_framework/geno_5/MAF_5/suggestive_snps_testing_K0_ld.txt") %>%
+			select(Chr) %>%
+			separate(Chr, into = c("Chr", "ChrPos", "ref", "alt", "id"), sep = ":") %>%
+			select(Chr, ChrPos) %>%
+			mutate(Chr = as.numeric(str_remove(Chr, "_v2")), ChrPos = as.numeric(ChrPos))
+	) %>%
+	unique()
+
+## SNP-centric results
+
+## DE-centric results (within 500bp)
+window_bp <- 500
+
+### Parse cis+trans SNPs into Chr / ChrPos
+cis_trans_parsed <- cis_trans_all %>%
+  distinct(transcript_id, SNP, .keep_all = TRUE) %>%  # guard against dup rows
+  separate(SNP, into = c("chr_str","pos_str","ref","alt","extra"),
+           sep = ":", remove = FALSE, fill = "right") %>%
+  mutate(
+    Chr    = as.numeric(str_remove(chr_str, "_v2")),  # "07_v2" -> 7
+    ChrPos = suppressWarnings(as.integer(pos_str))
+  ) %>%
+  filter(!is.na(Chr), !is.na(ChrPos)) %>%
+  select(transcript_id, analysis, class, PValue, lambda, SNP, description, description_source,
+         Chr, ChrPos)
+
+### Exact overlap (perfect match to a GWAS SNP)
+exact_overlap <- cis_trans_parsed %>%
+  inner_join(gwas_results %>% mutate(Chr = as.numeric(Chr), ChrPos = as.integer(ChrPos)),
+             by = c("Chr","ChrPos"))
+
+### Window overlap (± window_bp)
+# Join on Chr then filter by distance; keep the nearest GWAS SNP per (transcript,SNP)
+window_overlap_raw <- cis_trans_parsed %>%
+  inner_join(gwas_results %>% mutate(Chr = as.numeric(Chr), ChrPos_gwas = as.integer(ChrPos)) %>%
+               select(Chr, ChrPos_gwas),
+             by = "Chr") %>%
+  mutate(dist_bp = abs(ChrPos - ChrPos_gwas)) %>%
+  filter(dist_bp <= window_bp)
+
+window_overlap <- window_overlap_raw %>%
+  group_by(transcript_id, SNP) %>%
+  slice_min(dist_bp, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+### Quick counts
+n_exact_pairs      <- nrow(exact_overlap)                # # of (tx,SNP) that are exactly a GWAS SNP
+n_window_pairs     <- nrow(window_overlap)               # # of (tx,SNP) within ±window of a GWAS SNP
+n_tx_exact         <- n_distinct(exact_overlap$transcript_id)
+n_tx_window        <- n_distinct(window_overlap$transcript_id)
+n_gwas_exact       <- n_distinct(exact_overlap$ChrPos)   # # distinct GWAS SNPs hit exactly
+n_gwas_window      <- n_distinct(window_overlap$ChrPos_gwas)
+
+message(sprintf("Exact overlap: %d pairs | %d transcripts | %d GWAS SNPs",
+                n_exact_pairs, n_tx_exact, n_gwas_exact))
+message(sprintf("Window overlap (±%dbp): %d pairs | %d transcripts | %d GWAS SNPs",
+                window_bp, n_window_pairs, n_tx_window, n_gwas_window))
+
+write_tsv(window_overlap, "results/de-eqtl_results_window_overlap_with_gwas.tsv")
+```
+
+
+# Plotting (same env as above, just separated for clarity)
+
+## Combined manhattan plot for eQTL results
+
+```{R,eval=F}
+library(tidyverse)
+library(patchwork)
+
+# ---------------- helpers ----------------
+parse_eqtl_chrpos <- function(df, snp_col = "SNP") {
+	df %>%
+		arrange(transcript_id, !!sym(snp_col), class, PValue) %>%
+		distinct(transcript_id, !!sym(snp_col), .keep_all = TRUE) %>%
+		separate({{ snp_col }}, into = c("Chr","ChrPos","ref","alt","extra"),
+				sep = ":", remove = FALSE, fill = "right") %>%
+		mutate(
+		Chr    = as.integer(str_remove(Chr, "_v2")),
+		ChrPos = suppressWarnings(as.integer(ChrPos))
+		) %>%
+		select(Chr, ChrPos, PValue)
+}
+
+prep_eqtl_for_plot <- function(df, label) {
+	parse_eqtl_chrpos(df, "SNP") %>% mutate(panel = label)
+}
+
+# Common chromosome levels used everywhere
+chr_levels <- 1:14
+std_chrpos <- function(df) {
+	df %>% mutate(Chr = as.integer(Chr), ChrPos = as.integer(ChrPos))
+}
+
+align_to_ref <- function(df, ref) {
+	df %>%
+		mutate(Chr = factor(as.integer(Chr), levels = chr_levels)) %>%
+		inner_join(ref, by = c("Chr","ChrPos")) %>%
+		mutate(logP = -log10(PValue))
+}
+
+# unified x scale based on global ref (defined later)
+scale_x_cumu <- function(show_x_labels = TRUE) {
+	scale_x_continuous(
+		limits = x_lim,
+		breaks = chr_labs_global$center,
+		labels = if (show_x_labels) levels(chr_labs_global$Chr) else NULL,
+		expand = c(0, 0)
+	)
+}
+
+# eQTL panel with optional GWAS vlines and near‑GWAS highlighting
+manhattan_panel <- function(df_aligned,
+							ylab = expression(-log[10](italic(p))),
+							show_x_labels = FALSE,
+							thr1 = NULL, thr2 = NULL,
+							vlines_df = NULL,
+							highlight = FALSE) {
+
+	p <- ggplot()
+
+	if (!is.null(vlines_df)) {
+		p <- p + geom_vline(
+		data = vlines_df,
+		aes(xintercept = SNP_idx),
+		colour = "black", alpha = 0.25, linewidth = 0.3
+		)
+	}
+
+	if (highlight && "near_gwas" %in% names(df_aligned)) {
+		p <- p + geom_point(
+		data = df_aligned,
+		aes(SNP_idx, logP, colour = Chr, shape = near_gwas),
+		alpha = 0.9, size = 1
+		) +
+		scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 21), drop = FALSE)
+	} else {
+		p <- p + geom_point(
+		data = df_aligned,
+		aes(SNP_idx, logP, colour = Chr),
+		alpha = 0.9, size = 0.9
+		)
+	}
+
+	p +
+		scale_colour_viridis_d(drop = FALSE) +
+		scale_x_cumu(show_x_labels) +
+		labs(x = if (show_x_labels) "Chromosome" else NULL, y = ylab) +
+		theme(
+		legend.position = "none",
+		axis.title = element_text(size = 12),
+		axis.text  = element_text(size = 10),
+		axis.text.x = if (show_x_labels) element_text(size = 10) else element_blank(),
+		axis.ticks.x = if (show_x_labels) element_line() else element_blank()
+		) +
+		{ if (!is.null(thr1)) geom_hline(yintercept = -log10(thr1), linetype = 2) } +
+		{ if (!is.null(thr2)) geom_hline(yintercept = -log10(thr2), linetype = "dotted") }
+}
+
+# ---------------- load/prepare GWAS ----------------
+severity_path <- "/g/data/pq84/malaria/Parasite_and_human_genetic_risk_factors_for_Pk_malaria/outputs/05_Analyses/GWAS/fastlmm_updated_framework/geno_5/MAF_5/"
+parasitemia_path <- "/g/data/pq84/malaria/warpedLMM/warpedLMM/data/warpedlmm_updated_framework/geno_10/MAF_5/"
+
+# Bonferroni thresholds
+n_snps_sev  <- read_tsv(file.path(severity_path,   "fastLMM_ld.bim"),  col_names = FALSE, show_col_types = FALSE) %>% nrow()
+n_snps_para <- read_tsv(file.path(parasitemia_path,"warpedLMM_ld.bim"), col_names = FALSE, show_col_types = FALSE) %>% nrow()
+thr_sev  <- 0.05 / n_snps_sev
+thr_para <- 0.05 / n_snps_para
+
+# GWAS tables
+sev <- read_tsv(file.path(severity_path, "testing_K0_ld.tsv"), show_col_types = FALSE) %>%
+	mutate(Chr = as.factor(as.numeric(Chr)), ChrPos = as.integer(ChrPos), PValue = as.numeric(PValue)) %>%
+	select(Chr, ChrPos, PValue) %>% std_chrpos()
+
+para <- read_tsv(file.path(parasitemia_path, "testing_k0_ld_covar/gwas_results.feather"),
+					show_col_types = FALSE) %>%
+	mutate(Chr = as.factor(as.numeric(Chr)), ChrPos = as.integer(ChrPos), PValue = as.numeric(PValue)) %>%
+	select(Chr, ChrPos, PValue) %>% std_chrpos()
+
+# ---------------- UNION reference for cumulative x ----------------
+cis_pos   <- prep_eqtl_for_plot(de_cis,   "cis-eQTL")   %>% select(Chr, ChrPos) %>% std_chrpos()
+trans_pos <- prep_eqtl_for_plot(de_trans, "trans-eQTL") %>% select(Chr, ChrPos) %>% std_chrpos()
+gwasE_pos <- prep_eqtl_for_plot(gwas_long,"gwas-eQTL")  %>% select(Chr, ChrPos) %>% std_chrpos()
+
+snp_ref <- bind_rows(sev, para, cis_pos, trans_pos, gwasE_pos) %>%
+	distinct(Chr, ChrPos) %>%
+	mutate(Chr = factor(Chr, levels = chr_levels)) %>%
+	arrange(Chr, ChrPos) %>%
+	mutate(SNP_idx = row_number())
+
+chr_labs_global <- snp_ref %>%
+	group_by(Chr) %>%
+	summarise(
+		x_start = min(SNP_idx),
+		x_end   = max(SNP_idx),
+		center  = (x_start + x_end)/2,
+		.groups = "drop"
+	)
+
+x_lim <- range(snp_ref$SNP_idx)
+
+# ---------------- GWAS: aligned points + vline indices ----------------
+sev_a  <- align_to_ref(sev,  snp_ref) %>% mutate(trait = "severity")
+para_a <- align_to_ref(para, snp_ref) %>% mutate(trait = "parasitemia")
+
+# Significant/suggestive leads to vertical lines
+sev_sig  <- sev  %>% filter(PValue <= thr_sev  | PValue <= 1e-4)
+para_sig <- para %>% filter(PValue <= thr_para | PValue <= 1e-4)
+
+gw_lines_idx <- bind_rows(sev_sig, para_sig) %>%
+	distinct(Chr, ChrPos) %>%
+	mutate(Chr = factor(Chr, levels = chr_levels)) %>%
+	inner_join(snp_ref, by = c("Chr","ChrPos")) %>%
+	distinct(SNP_idx)
+
+# ---------------- eQTL panels ----------------
+cis_a   <- prep_eqtl_for_plot(de_cis,   "cis-eQTL")   %>% align_to_ref(snp_ref)
+trans_a <- prep_eqtl_for_plot(de_trans, "trans-eQTL") %>% align_to_ref(snp_ref)
+gwasE_a <- prep_eqtl_for_plot(gwas_long,"gwas-eQTL")  %>% align_to_ref(snp_ref)
+
+# near‑GWAS flags (many‑to‑many is expected and OK)
+window_bp <- 500
+flag_near_gwas <- function(eqtl_df) {
+	leads_tbl <- bind_rows(sev_sig, para_sig) %>%
+		mutate(Chr = factor(as.integer(Chr), levels = chr_levels)) %>%  # <-- match factor levels
+		rename(gwPos = ChrPos) %>%
+		select(Chr, gwPos)
+
+	eqtl_df %>%
+		# (eqtl_df$Chr is already factor w/ chr_levels from align_to_ref)
+		left_join(leads_tbl, by = "Chr", relationship = "many-to-many") %>%
+		mutate(near_gwas = !is.na(gwPos) & abs(ChrPos - gwPos) <= window_bp) %>%
+		group_by(Chr, ChrPos, SNP_idx, logP) %>%
+		summarise(near_gwas = any(near_gwas), .groups = "drop")
+}
+cis_a_hl   <- flag_near_gwas(cis_a)
+trans_a_hl <- flag_near_gwas(trans_a)
+gwasE_a_hl <- flag_near_gwas(gwasE_a)
+
+# ---------------- plots ----------------
+# Panel A: overlay GWAS (two traits) with thresholds
+gwasa <- bind_rows(sev_a, para_a)
+pA <- ggplot(gwasa, aes(SNP_idx, logP, colour = Chr, shape = trait)) +
+	geom_point(alpha = 0.8, size = 0.9) +
+	geom_hline(yintercept = -log10(thr_sev), linetype = 2) +
+	geom_hline(yintercept = -log10(1e-4),    linetype = "dotted") +
+	scale_colour_viridis_d(drop = FALSE) +
+	scale_x_cumu(TRUE) +
+	labs(x = "Chromosome", y = expression(-log[10](italic(p)))) +
+	theme(
+		legend.position = "right",
+		legend.title = element_blank(),
+		axis.title = element_text(size = 12),
+		axis.text  = element_text(size = 10)
+	) +
+	guides(colour = "none")
+
+# Panels B–D: eQTLs with GWAS vlines + highlight
+pB <- manhattan_panel(cis_a_hl,   show_x_labels = FALSE, vlines_df = gw_lines_idx, highlight = TRUE)
+pC <- manhattan_panel(trans_a_hl, show_x_labels = FALSE, vlines_df = gw_lines_idx, highlight = TRUE)
+pD <- manhattan_panel(gwasE_a_hl, show_x_labels = TRUE,  vlines_df = gw_lines_idx, highlight = TRUE)
+
+final_plot <- (pA / pB / pC / pD) +
+	plot_annotation(tag_levels = "A") &
+	theme(panel.grid = element_blank())
+
+ggsave("results/manhattan_multi_panel_cumulative.png", final_plot, width = 12, height = 12, dpi = 300)
+
+# ---------------- tracks version ----------------
+e_tracks <- bind_rows(
+	cis_a   %>% mutate(analysis = "cis-eQTL"),
+	trans_a %>% mutate(analysis = "trans-eQTL"),
+	gwasE_a %>% mutate(analysis = "gwas-eQTL")
+	) %>%
+	mutate(analysis = factor(analysis, levels = c("cis-eQTL","trans-eQTL","gwas-eQTL")),
+				size = scales::rescale(logP, to = c(0.5, 1.5)))
+
+y_map <- tibble(analysis = levels(e_tracks$analysis),
+					y = seq_along(levels(e_tracks$analysis)))
+e_tracks <- e_tracks %>% left_join(y_map, by = "analysis")
+
+p_tracks <- ggplot() +
+	geom_vline(data = gw_lines_idx, aes(xintercept = SNP_idx),
+				inherit.aes = FALSE, colour = "black", alpha = 0.25, linewidth = 0.3) +
+	geom_jitter(data = e_tracks, aes(SNP_idx, y, colour = Chr, size = size),
+				alpha = 0.75, height = 0.15, width = 0) +
+	scale_colour_viridis_d(drop = FALSE) +
+	scale_size_identity() +
+	scale_y_continuous(breaks = y_map$y, labels = y_map$analysis,
+						limits = c(0.5, max(y_map$y) + 0.5)) +
+	scale_x_cumu(TRUE) +
+	labs(x = "Chromosome", y = NULL) +
+	theme(
+		legend.position = "none",
+		axis.title = element_text(size = 12),
+		axis.text  = element_text(size = 10),
+		axis.title.x = element_blank()
+	)
+
+tracks_plot <- (p_tracks / pA) +
+	plot_annotation(tag_levels = "A") &
+	theme(panel.grid = element_blank())
+
+ggsave("results/manhattan_eqtl_tracks.png", tracks_plot, width = 12, height = 6, dpi = 300)
+```
+
+## Genotype vs expression plots
+
+```{bah,eval=F}
+plink2 \
+	--bfile cleaned_overlap \
+	--export A \
+	--out cleaned_overlap_dosage
+
+
+plink2 \
+  --bfile cleaned_overlap \
+  --extract hits.snplist \
+  --export A \
+  --out hits_dosage
+```
+
+```{R,eval=F}
+library(tidyverse)
+library(edgeR)
+library(SummarizedExperiment)
+
+## 1) Choose level = TRANSCRIPT (match eQTL)
+#    Build transcript-level logCPM (no A1H1 collapse)
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+counts_tr <- assay(se, "counts")
+logCPM_tr <- cpm(counts_tr, log = TRUE, prior.count = 1)
+expr_long <- as.data.frame(logCPM_tr) %>%
+  rownames_to_column("transcript_id") %>%
+  pivot_longer(-transcript_id, names_to = "sample", values_to = "logCPM") %>%
+  mutate(sample_base = sub("\\.txt$", "", sample)) %>%
+  select(transcript_id, sample_base, logCPM)
+
+## 2) Build the exact sample map used in the eQTL run
+id_map <- read_tsv("overlapping_samples_index.tsv", show_col_types = FALSE) %>%
+  transmute(IID = plink,
+            sample_base = sub("\\.txt$", "", expr))
+# sanity: uniqueness
+stopifnot(n_distinct(id_map$IID) == nrow(id_map))
+stopifnot(n_distinct(id_map$sample_base) == nrow(id_map))
+
+## 3) Harmonise eQTL hits and select candidates to plot
+common_cols <- c("transcript_id","SNP","PValue","lambda","class","description","analysis")
+cis_sel   <- de_cis   %>% mutate(analysis = "cis")   %>% select(any_of(common_cols))
+trans_sel <- de_trans %>% mutate(analysis = "trans") %>% select(any_of(common_cols))
+gwas_sel  <- gwas_long%>% mutate(analysis = "gwas")  %>% select(any_of(common_cols))
+
+eqtl_hits_all <- bind_rows(cis_sel, trans_sel, gwas_sel) %>%
+  filter(lambda >= 0.95, lambda <= 1.05, class %in% c("sig","sugg")) %>%
+  mutate(transcript_id = str_remove(transcript_id, "_$"))
+
+# Parse to CHR:POS:REF:ALT exactly
+parse_snp_to_plink_id <- function(s){
+  tibble(SNP = s) %>%
+    separate(SNP, into = c("Chr","Pos","Ref","Alt","extra"),
+             sep = ":", fill = "right", remove = FALSE) %>%
+    mutate(Chr = str_remove(Chr, "_v2"),
+           plink_id = paste0(as.integer(Chr), ":", Pos, ":", Ref, ":", Alt)) %>%
+    pull(plink_id)
+}
+
+eqtl_hits_all <- eqtl_hits_all %>% mutate(plink_id = parse_snp_to_plink_id(SNP))
+
+# Make one row per (transcript_id, plink_id, analysis): keep smallest P
+eqtl_hits <- eqtl_hits_all %>%
+  group_by(transcript_id, plink_id, analysis) %>%
+  slice_min(PValue, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+eqtl_hits %>% filter(plink_id == "11:364594:C:A")
+
+
+# Read in and subset the genotype data
+geno_raw <- read_tsv("cleaned_overlap_dosage.raw", progress = FALSE, show_col_types = FALSE)
+non_var_cols <- intersect(c("FID","IID","PAT","MAT","SEX","PHENOTYPE"), names(geno_raw))
+variant_cols <- setdiff(names(geno_raw), non_var_cols)
+
+# Fix geno ids from the .raw file to match the eQTL hits positions
+geno_keys <- tibble(raw = variant_cols) %>%
+  mutate(clean = raw) %>%
+  # strip prefixes/suffixes we’ve seen in your files
+  mutate(clean = str_remove(clean, "^ordered_PKNH_"),
+         clean = str_remove(clean, "^new"),
+         clean = str_remove(clean, "^chr"),
+         clean = str_remove(clean, "(:\\._[ACGT])$"),  # e.g. ':._T'
+         clean = str_remove(clean, "_A1$")) %>%
+  # collapse versioning/zero-padding and underscores
+  mutate(clean = str_replace(clean, "^0*([0-9]+)_v2:", "\\1:"),
+         clean = str_replace(clean, "^0*([0-9]+):", "\\1:"),
+         clean = str_replace_all(clean, "_", ":")) %>%
+  # split into fields
+  separate_wider_delim(clean, ":", names = c("C","P","R","A","extra"),
+                       too_few = "align_start", too_many = "drop") %>%
+  mutate(Chr = suppressWarnings(as.integer(C)),
+         Pos = suppressWarnings(as.integer(P))) %>%
+  filter(!is.na(Chr), !is.na(Pos)) %>%
+  mutate(
+    chrpos = paste0(Chr, ":", Pos),
+    full   = ifelse(!is.na(R) & !is.na(A), paste0(Chr, ":", Pos, ":", R, ":", A), NA_character_),
+    chrpos = as.character(chrpos),
+    full   = as.character(full)
+  ) %>%
+  select(raw, chrpos, full) %>%
+  distinct()
+
+wanted_vars <-  geno_keys %>%
+	filter(full %in% eqtl_hits$plink_id)
+
+# Subset geno_raw to those variants + metadata cols
+geno_sub <- geno_raw %>%
+  select(all_of(non_var_cols), all_of(wanted_vars$raw))
+
+
+# Read in and subset the expression data
+expr_sub <- expr_long %>%
+  semi_join(eqtl_hits %>% distinct(transcript_id), by = "transcript_id") %>%
+  # add the PLINK IID used in genotype files
+  inner_join(id_map, by = "sample_base") %>%
+  # keep only what we need for downstream joins
+  select(IID, transcript_id, logCPM, sample_base)
+
+# Make a long genotype table for just the eQTL variants
+# Keep IID + the wanted variant columns, pivot long, attach the full plink_id
+geno_long <- geno_sub %>%
+  select(IID, all_of(wanted_vars$raw)) %>%
+  pivot_longer(-IID, names_to = "raw", values_to = "dosage") %>%
+  left_join(wanted_vars, by = "raw") %>%
+  transmute(
+    IID,
+    plink_id = full,   # CHR:POS:REF:ALT (matches eqtl_hits$plink_id)
+    chrpos,
+    dosage = if_else(dosage == 1, NA_real_, dosage)  # set hets to NA
+  )
+
+# Build eQTL keys and join: transcript ↔ expression ↔ genotype
+eqtl_keys <- eqtl_hits %>%
+  select(transcript_id, plink_id, analysis, description, PValue, class)
+
+full_data <- eqtl_keys %>%
+  inner_join(expr_sub,  by = "transcript_id") %>%
+  inner_join(geno_long, by = c("IID", "plink_id")) %>%
+  mutate(
+    geno_cat = factor(round(dosage), levels = c(0, 2), labels = c("0", "2"))
+  )
+
+# Add metadata for
+full_data <- full_data %>%
+  left_join(
+		colData(se) %>%
+			as.data.frame() %>%
+			rownames_to_column("sample") %>%
+			mutate(sample_base = sub("\\.txt$", "", sample)) %>%
+			select(sample_base, group)  # assuming 'group' is your Sm/Um col
+	, by = c("sample_base") 
+  )
+
+# Get top differencs to explore and plot
+
+# ---- Good-signal QC thresholds (unchanged; tweak if needed) ----
+min_expr_logcpm    <- -1.5   # "measurable" expression
+min_per_geno       <- 5      # >=5 samples per genotype with measurable expr
+min_expressed_frac <- 0.50   # >=50% of all samples show measurable expr
+min_abs_diff       <- 0.75   # optional visual separation
+
+# Flag measurable expression once; keep genotype coding as 0/1
+full_data <- full_data %>% 
+  mutate(
+    measurable = !is.na(logCPM) & logCPM > min_expr_logcpm,
+    geno_cat   = factor(round(dosage) / 2, levels = c(0, 1), labels = c("0", "1"))
+  )
+
+# Summarise per SNP–transcript pair with "good-signal" QC
+# NOTE: qc_p is only for internal ranking of pretty plots; do NOT report it.
+geno_exp_stats <- full_data %>%
+  filter(!is.na(geno_cat)) %>%
+  group_by(transcript_id, plink_id, analysis, description) %>%
+  summarise(
+    n_total   = n(),
+    n_meas    = sum(measurable, na.rm = TRUE),
+    frac_meas = n_meas / n_total,
+
+    n0        = sum(geno_cat == "0"),
+    n1        = sum(geno_cat == "1"),
+    n0_meas   = sum(geno_cat == "0" & measurable, na.rm = TRUE),
+    n1_meas   = sum(geno_cat == "1" & measurable, na.rm = TRUE),
+
+    mean0     = mean(logCPM[geno_cat == "0" & measurable], na.rm = TRUE),
+    mean1     = mean(logCPM[geno_cat == "1" & measurable], na.rm = TRUE),
+    diff_mean = mean1 - mean0,
+
+    qc_p      = ifelse(n0_meas > 1 & n1_meas > 1,
+                       t.test(logCPM ~ geno_cat, subset = measurable)$p.value,
+                       NA_real_),
+    .groups = "drop"
+  ) %>%
+  # Good-signal filters (no multiple-testing step here)
+  filter(
+    frac_meas >= min_expressed_frac,
+    n0_meas   >= min_per_geno,
+    n1_meas   >= min_per_geno,
+    abs(diff_mean) >= min_abs_diff
+  ) %>%
+  arrange(qc_p, desc(abs(diff_mean)))   # internal ranking only
+
+# Pick top 20 (or change to 10)
+top_hits <- geno_exp_stats %>% slice_head(n = 20)
+
+# Example plot for the top significant hit
+top_pair <- top_hits %>% filter(transcript_id == "TRINITY_DN9322_c0_g1")
+
+box_plot <- full_data %>%
+	filter(transcript_id == top_pair$transcript_id,
+			plink_id == top_pair$plink_id) %>%
+	filter(!is.na(geno_cat)) %>%
+	ggplot(aes(x = geno_cat, y = logCPM)) +
+	geom_boxplot(outlier.shape = NA) +
+	geom_jitter(aes(colour = group), width = 0.1, alpha = 0.7) +
+	scale_colour_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+	guides(colour = guide_legend(title = "Group")) +
+	labs(
+		x = "Genotype",
+		y = "logCPM expression"
+	)  +
+	theme(
+		axis.title = element_text(size = 12),
+		axis.text  = element_text(size = 10)
+	)
+
+ggsave("results/genotype_expression_plot.png", box_plot, width = 8, height = 6, dpi = 300)
+
+
+# Top 10 to plot (unchanged)
+top10 <- top_hits %>% dplyr::slice_min(p_adj, n = 10)
+
+# Build plotting df and compute the ordering by mean expression
+plot_df <- full_data %>%
+  semi_join(top10, by = c("transcript_id","plink_id","analysis","description")) %>%
+  filter(!is.na(geno_cat)) %>%
+  mutate(pair_label = paste0(description, "\n", plink_id))
+
+order_tbl <- plot_df %>%
+  group_by(pair_label) %>%
+  summarise(mean_expr = mean(logCPM, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_expr))
+
+plot_df <- plot_df %>%
+  mutate(pair_label = factor(pair_label, levels = order_tbl$pair_label))
+
+# Plot (unchanged aesthetics, now using plot_df)
+box_plot <- ggplot(plot_df, aes(x = pair_label, y = logCPM, fill = group)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75), width = 0.6) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+              alpha = 0.4, size = 0.8) +
+  scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+  labs(x = "Transcript to SNP pair", y = "logCPM") +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  )
+
+ggsave("results/genotype_expression_plot_top10.png", box_plot, width = 12, height = 10, dpi = 300)
+
+# curated
+
+keep_tx <- c(
+  #"TRINITY_DN1690_c29_g1",
+  "TRINITY_DN82526_c1_g1",
+  "TRINITY_DN4936_c0_g1",
+  "TRINITY_DN128112_c0_g1",
+  "TRINITY_DN3975_c0_g1",
+  "TRINITY_DN800_c0_g1"
+)
+
+top10 <- top_hits %>% 
+	filter(transcript_id %in% keep_tx)
+
+# desired x-axis order
+desired_order <- keep_tx
+
+# levels for pair_label in desired transcript order
+
+full_data_ab <- full_data %>%
+	mutate(description = case_when(
+		description == "1-cys peroxiredoxin, putative" ~ "1-cys peroxiredoxin",
+		description == "conserved Plasmodium protein, unknown function" ~ "Plasmodium protein",
+		description == "blood-stage antigen 41-3, putative" ~ "Blood-stage antigen 41-3",
+		description == "Structural maintenance of chromosomes protein 1A" ~ "SMC1A",
+		TRUE ~ description
+	)) 
+
+top10_ab <- top10 %>%
+	mutate(description = case_when(
+		description == "1-cys peroxiredoxin, putative" ~ "1-cys peroxiredoxin",
+		description == "conserved Plasmodium protein, unknown function" ~ "Plasmodium protein",
+		description == "blood-stage antigen 41-3, putative" ~ "Blood-stage antigen 41-3",
+		description == "Structural maintenance of chromosomes protein 1A" ~ "SMC1A",
+		TRUE ~ description
+	)) 
+
+
+pair_levels <- full_data_ab %>%
+	semi_join(top10_ab, by = c("transcript_id","plink_id","analysis","description")) %>%
+	distinct(transcript_id, description, plink_id) %>%
+	mutate(transcript_id = factor(transcript_id, levels = desired_order)) %>%
+	arrange(transcript_id) %>%
+	transmute(pair_label = paste0(description, "\n", plink_id)) %>%
+	pull(pair_label)
+
+plot_df <- full_data_ab %>%
+	semi_join(top10_ab, by = c("transcript_id","plink_id","analysis","description")) %>%
+	filter(!is.na(geno_cat)) %>%
+	mutate(
+		transcript_id = factor(transcript_id, levels = desired_order),
+		pair_label    = factor(paste0(description, "\n", plink_id), levels = pair_levels)
+	) 
+# Plot (unchanged aesthetics)
+box_plot <- ggplot(plot_df, aes(x = pair_label, y = logCPM, fill = group)) +
+	geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75), width = 0.6) +
+	geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+				alpha = 0.4, size = 0.8) +
+	scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+	labs(x = "Transcript to SNP pair", y = "logCPM", fill = "Group") +
+	theme(
+		axis.text  = element_text(size = 12),
+		axis.title = element_text(size = 14),
+		axis.text.x = element_text(angle = 90, hjust = 1),
+		legend.text = element_text(size = 14),
+		legend.title = element_text(size = 16)
+	)
+
+ggsave("results/genotype_expression_plot_curated_biology.png", box_plot, width = 12, height = 6, dpi = 300)
+```
+
+Box plots:
+SICAvar/KIR in top hits?
+or gametocyte related?
+Look at signals of top 10 or 20
+
+
+top_hits %>%
+	select(transcript_id, description, plink_id, diff_mean, qc_p) %>% print(n = 25)
+
+
+## Loci plots
+
+```{R,eval=F}
+library(tidyverse)
+
+# Find the per-transcript eQTL file in any results/eqtl_results* directory
+find_eqtl_file <- function(transcript_id, roots = "results") {
+	cand_dirs <- list.dirs(roots, recursive = FALSE, full.names = TRUE)
+	cand_dirs <- cand_dirs[startsWith(basename(cand_dirs), "eqtl_results")]
+	paths <- file.path(cand_dirs, paste0(transcript_id, ".tsv"))
+	paths[ file.exists(paths) ][1] %||% NA_character_
+}
+
+# Make a locus plot for one transcript/lead
+locus_plot_transcript <- function(transcript_id,
+									lead_plink_id,
+									window_bp = 5e4,
+									roots = "results",
+									geno_raw,        # data.frame from cleaned_overlap_dosage.raw
+									geno_keys        # tibble with columns: raw, chrpos, full
+									) {
+
+	# ---- 1) Read eQTL table for this transcript
+	eqtl_path <- find_eqtl_file(transcript_id, roots)
+	if (is.na(eqtl_path)) stop("Could not find transcript file for: ", transcript_id, call. = FALSE)
+	df_raw <- readr::read_tsv(eqtl_path, show_col_types = FALSE)
+
+	# ---- 2) Parse SNP column → plink_id (CHR:POS:REF:ALT), chrpos, Chr, Pos
+	eqtl_tbl <- df_raw %>%
+		mutate(
+		SNP_clean = SNP %>%
+			str_remove("^ordered_PKNH_") %>%
+			str_replace("^(\\d+)_v2:", "\\1:")
+		) %>%
+		tidyr::separate_wider_delim(
+			SNP_clean, ":", 
+			names = c("SNP_Chr","SNP_Pos","SNP_Ref","SNP_Alt","SNP_extra"),
+			too_many = "drop", too_few = "align_start"
+		) %>%
+		mutate(
+			SNP_Chr = suppressWarnings(as.integer(SNP_Chr)),
+			SNP_Pos = suppressWarnings(as.integer(SNP_Pos)),
+			plink_id = paste0(SNP_Chr, ":", SNP_Pos, ":", SNP_Ref, ":", SNP_Alt),
+			chrpos   = paste0(SNP_Chr, ":", SNP_Pos)
+		) %>%
+		transmute(plink_id, chrpos, Chr = SNP_Chr, Pos = SNP_Pos, PValue = as.numeric(PValue)) %>%
+		filter(!is.na(Chr), !is.na(Pos), !is.na(PValue)) %>%
+		distinct()
+
+	# ---- 3) Lead + window
+	lead_info <- eqtl_tbl %>% filter(plink_id == lead_plink_id) %>% dplyr::slice(1)
+	if (nrow(lead_info) == 0) stop("Lead plink_id not found in transcript file: ", lead_plink_id, call. = FALSE)
+
+	chr0  <- lead_info$Chr
+	pos0  <- lead_info$Pos
+	x_min <- pos0 - window_bp
+	x_max <- pos0 + window_bp
+
+	eqtl_win <- eqtl_tbl %>% filter(Chr == chr0, Pos >= x_min, Pos <= x_max)
+	if (nrow(eqtl_win) == 0) stop("No eQTL variants in window for: ", transcript_id, call. = FALSE)
+
+	# ---- 4) Map window variants -> .raw columns; build window genotype matrix
+	want_cols <- geno_keys %>% semi_join(eqtl_win %>% select(chrpos), by = "chrpos")
+	if (nrow(want_cols) == 0) stop("No matching genotype columns for window variants.", call. = FALSE)
+
+	raw_lead <- want_cols %>% filter(chrpos == str_replace(lead_plink_id, "^([0-9]+:[0-9]+):.*$", "\\1")) %>%
+		pull(raw) %>% { if (length(.) == 0) NA_character_ else .[[1]] }
+	if (is.na(raw_lead) || !(raw_lead %in% names(geno_raw))) {
+		stop("Could not locate lead genotype column in geno_raw for: ", lead_plink_id, call. = FALSE)
+	}
+
+	geno_win <- geno_raw %>%
+		select(IID, all_of(c(raw_lead, want_cols$raw))) %>%
+		mutate(across(-IID, ~ ifelse(. == 1, NA_real_, as.numeric(.))))  # hets -> NA
+
+	# ---- 5) LD (r²) vs lead
+	lead_vec <- geno_win[[raw_lead]]
+	ld_tbl <- purrr::map_dfr(want_cols$raw, function(cn) {
+		v <- geno_win[[cn]]
+		r <- suppressWarnings(stats::cor(lead_vec, v, use = "pairwise.complete.obs"))
+		tibble(raw = cn, r2 = ifelse(is.finite(r), r^2, NA_real_))
+	}) %>%
+		left_join(want_cols, by = "raw") %>%
+		mutate(plink_id = full) %>%
+		select(plink_id, chrpos, r2)
+
+	# ---- 6) Assemble plotting data
+	plot_df <- eqtl_win %>%
+	mutate(lead = (plink_id == lead_plink_id)) %>%
+	left_join(ld_tbl, by = "plink_id") %>%
+	mutate(
+		logP = -log10(PValue),
+		r2   = pmin(pmax(r2, 0), 1),
+		Pos_100kb = Pos / 1e5       # <-- add scaling here
+	)
+
+	# ---- 7) Plot
+	p <- ggplot(plot_df, aes(x = Pos_100kb, y = logP)) +
+	geom_point(aes(colour = r2), size = 1.6) +
+	geom_point(data = subset(plot_df, lead),
+				shape = 21, fill = "black", colour = "white",
+				size = 3, stroke = 0.3) +
+	geom_vline(xintercept = pos0 / 1e5, linetype = "dashed", linewidth = 0.4) +
+	scale_colour_viridis_c(option = "D", na.value = "grey75", name = expression(r^2)) +
+	labs(
+		x = paste0("Chr ", chr0, " position (100 Kbp)"),
+		y = expression(-log[10](italic(p)))
+	) +
+	theme(
+		axis.title = element_text(size = 12),
+		axis.text  = element_text(size = 10)
+	)
+
+		return(p)
+}
+
+
+transcript_id <- "TRINITY_DN100881_c0_g1"
+lead_plink_id <- "11:1468055:C:A"
+p <- locus_plot_transcript(transcript_id, lead_plink_id,
+                           window_bp = 5e4,
+                           roots = "results",
+                           geno_raw = geno_raw,
+                           geno_keys = geno_keys)
+
+ggsave("results/locus_plot_example.png", p, width = 7.5, height = 5, dpi = 300)
+
+# Find some interesting transcripts with multiple significant hits
+max_gap <- 2000L  # bp distance to start a new cluster; tune to taste
+
+# 1) Parse gwas_long -> per-transcript SNPs with numeric Chr/Pos and a plink-like ID
+gwasE_parsed <- gwas_long %>%
+  # keep only the hits you want to cluster (sig/sugg)
+  filter(class %in% c("sig","sugg")) %>%
+  separate(
+    SNP, into = c("Chr_raw","Pos_raw","Ref","Alt","extra"),
+    sep = ":", fill = "right", remove = FALSE
+  ) %>%
+  mutate(
+    Chr    = as.integer(str_remove(Chr_raw, "_v2")),
+    ChrPos = suppressWarnings(as.integer(Pos_raw)),
+    plink_id = paste0(Chr, ":", ChrPos, ":", Ref, ":", Alt)
+  ) %>%
+  # keep one row per transcript/SNP
+  distinct(transcript_id, Chr, ChrPos, plink_id, .keep_all = TRUE) %>%
+  filter(!is.na(Chr), !is.na(ChrPos))
+
+# 2) Cluster *within each transcript on each chromosome*
+clustered <- gwasE_parsed %>%
+  arrange(transcript_id, Chr, ChrPos) %>%
+  group_by(transcript_id, Chr) %>%
+  mutate(
+    gap = ChrPos - lag(ChrPos),
+    gap = ifelse(is.na(gap), Inf, gap),        # first row always starts a new cluster
+    cluster = cumsum(gap > max_gap)
+  ) %>%
+  ungroup() %>%
+  group_by(transcript_id, Chr, cluster) %>%
+  summarise(
+    n_snps       = n_distinct(plink_id),       # <-- count unique SNPs
+    start_bp     = min(ChrPos),
+    end_bp       = max(ChrPos),
+    span_bp      = end_bp - start_bp,
+    min_p        = min(PValue, na.rm = TRUE),
+    lead_plink_id= pluck(plink_id, which.min(PValue)),
+    gene_id      = dplyr::first(gene_id),
+    description  = dplyr::first(description),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_snps), span_bp, min_p)
+
+clustered %>%
+	dplyr::slice(1) %>%
+	select(transcript_id, lead_plink_id)
+
+transcript_id <- "TRINITY_DN9322_c0_g1"
+lead_plink_id <- "7:42684:C:T"
+p <- locus_plot_transcript(transcript_id, lead_plink_id,
+                           window_bp = 5e4,
+                           roots = "results",
+                           geno_raw = geno_raw,
+                           geno_keys = geno_keys)
+
+# for file name
+gwas_long %>%
+	filter(transcript_id == "TRINITY_DN9322_c0_g1") %>%
+	select(description)
+
+ggsave("results/locus_plot_chr7_snps7_conserved_Plasmodium_protein.png", p, width = 7.5, height = 5, dpi = 300)
+
+
+plot_loci <- function(transcript_ID,lead_plink_ID) {
+	transcript_id_ <- transcript_ID
+	lead_plink_id_ <- lead_plink_ID
+
+	chr <- clustered %>%
+		filter(transcript_id == transcript_id_) %>%
+		pull(Chr)
+
+	description <- clustered %>%
+		filter(transcript_id == transcript_id_) %>%
+		mutate(description = str_replace_all(description, " ", "_")) %>%
+		pull(description)
+
+	snp <- clustered %>%
+		filter(transcript_id == transcript_id_) %>%
+		pull(n_snps)
+
+	p <- locus_plot_transcript(transcript_id_, lead_plink_id_,
+                           window_bp = 5e4,
+                           roots = "results",
+                           geno_raw = geno_raw,
+                           geno_keys = geno_keys)
+
+	ggsave(paste0("results/locus_plot_chr", chr, "_snps", snp, "_", description, ".png"), p, width = 7.5, height = 5, dpi = 300)
+}
+
+
+
+clustered %>%
+	filter(transcript_id == "TRINITY_DN104182_c2_g2") %>%
+	select(transcript_id, lead_plink_id)
+
+plot_loci("TRINITY_DN104182_c2_g2", "12:1236086:G:A")
+
+```
+
+Transcripts to try loci plots for:
+TRINITY_DN9322_c0_g1 - unknown protein with 7 hits (GWAS)
+TRINITY_DN3975_c0_g1 - unknown protein with 6 hits (GWAS)
+TRINITY_DN159639_c1_g2 - dynein heavy chain, putative
+TRINITY_DN104182_c2_g2 - CCR4-ass factor 1 with lots of hits (GWAS) - related gametocytogeneis
+
+
+TRINITY_DN6124_c0_g1 - zinc finger protein, putative - related to epigenetic/transcriptional control
+TRINITY_DN26197_c0_g1 - ATP-dependent RNA helicase DBP5, putative  - related to epigenetic/transcriptional control
+TRINITY_DN5345_c0_g1 - E3 ubiquitin-protein ligase, putative
+TRINITY_DN26197_c0_g1 - ATP-dependent RNA helicase DBP5, putative
+TRINITY_DN24609_c0_g1 - centrin, putative 
+
+clustered %>%
+	filter(description == "ATP-dependent RNA helicase DBP5, putative" & n_snps > 2) %>% select(transcript_id)
+
+
+clustered %>% arrange(desc(n_snps)) %>% 
+	select(transcript_id, n_snps, description, Chr) %>%
+	print(n=30)
+
+
+top_box <- geno_exp_stats %>%
+  filter(!is.na(p_adj))  %>% 
+  select(description,transcript_id)
+
+  clustered %>%
+	filter(transcript_id %in% top_box$transcript_id) %>%
+	left_join(geno_exp_stats %>% select(transcript_id, description)) %>%
+	select(n_snps, description, transcript_id) %>%
+	print(n=25)

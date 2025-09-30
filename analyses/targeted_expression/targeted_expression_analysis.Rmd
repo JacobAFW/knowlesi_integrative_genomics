@@ -1,0 +1,1299 @@
+# Targeted expression analysis
+
+
+# Prepare environment
+
+```{bash,eval=F}
+start_pbs_big_boy
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/scaden/bin/activate
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv
+```
+
+# Annotation of assembly using prioritisation
+
+Similar to what we did with significant hits, but we will do for the filtered transcripts.
+Get transcript IDs from summarised DE object, and then add annotation from PKA1H1 and Trinotate.
+Filter to transcripts of interest.
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+
+readRDS("summarized_de_filter.rds") %>%
+	rownames() %>%
+	tibble(transcript_id = .) %>%
+	write_tsv("targeted_analysis/filtered_transcripts.txt", col_names = FALSE)
+```
+
+
+## PKA1H1 annotation
+
+```{bash,eval=F}
+cd targeted_analysis
+grep -F -f filtered_transcripts.txt /g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot_with_full_annotations.gtf > filtered_genes_annotation.txt
+grep 'description' filtered_genes_annotation.txt > filtered_genes_description.txt
+```
+
+```{R,eval=F}
+library(tidyverse)
+
+# Read in the DE results
+filt_trans <- read_tsv("filtered_transcripts.txt", col_names = FALSE) %>%
+	rename(gene = X1) 
+
+# Read in the description file
+desc_raw <- read_tsv("filtered_genes_description.txt", col_names = FALSE)
+
+# Extract gene_id and description from the 9th column (attributes)
+desc_clean <- desc_raw %>%
+  select(X9) %>%
+  mutate(
+	gene = str_extract(X9, 'gene_id\\s+\\"(TRINITY[^"]+)') %>% str_remove('gene_id\\s+\\"'),
+	description = str_extract(X9, 'description\\s+\\"([^"]+)') %>% str_remove('description\\s+\\"')
+  ) %>%
+  select(gene, description) %>%
+  mutate(gene = str_remove(gene, "_i.*")) %>%
+  distinct()  # remove duplicate entries for the same gene
+
+# Join with DE results
+filt_trans_with_desc <- filt_trans %>%
+  left_join(desc_clean, by = "gene")  
+
+write_tsv(filt_trans_with_desc, "filtered_transcripts_with_description.tsv")
+```
+
+## Trinotate annotation (& combine with PKA1H1)
+
+```{bash,eval=F}
+grep -F -f filtered_transcripts.txt /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond/trinity_assembly_unique_non_cod.Trinotate.tsv | 
+cat <(head -n 1 /g/data/pq84/malaria/Pk_trancsriptomics/outputs/annotation/diamond/trinity_assembly_unique.Trinotate.tsv) - \
+> filtered_transcripts_annotation_trinotate.txt
+```
+
+```{R,eval=F}
+library(tidyverse)
+
+genome_data <- read_tsv("filtered_transcripts_with_description.tsv") %>%
+  rename(PKA1H1_description = description) 
+
+trinotate <- read_tsv("filtered_transcripts_annotation_trinotate.txt", na = c(".", "")) %>%
+  rename(gene = `#gene_id`) %>%
+  arrange(
+	gene,
+	desc(!is.na(sprot_Top_BLASTX_hit)),
+	desc(!is.na(sprot_Top_BLASTP_hit)),
+	desc(!is.na(Pfam)),
+	desc(!is.na(SignalP)),
+	desc(!is.na(TmHMM)),
+	desc(!is.na(Kegg))
+  )
+
+# merge data
+merged_anno <- trinotate %>%
+  group_by(gene) %>%
+  summarise(
+	transcript_ids = paste(unique(transcript_id), collapse = ","),
+	across(
+	  -transcript_id,
+	  ~ {
+		vals <- unique(na.omit(.x))
+		if (length(vals) == 0) NA_character_ else if (length(vals) == 1) vals else paste(vals, collapse = ",")
+	  }
+	),
+	.groups = "drop"
+  ) %>%
+  left_join(genome_data) %>%
+  relocate(gene, PKA1H1_description) %>%
+  relocate(transcript_ids, .after = last_col()) %>%
+  mutate(
+	sprot_Top_BLASTX_hit = str_remove(sprot_Top_BLASTX_hit, ".*Full="),
+	sprot_Top_BLASTX_hit = str_remove(sprot_Top_BLASTX_hit, ";.*"),
+	sprot_Top_BLASTP_hit = str_remove(sprot_Top_BLASTP_hit, ".*Full="),
+	sprot_Top_BLASTP_hit = str_remove(sprot_Top_BLASTP_hit, ";.*"),
+	
+	# Extract all Rfam model names from the infernal column
+	infernal = ifelse(
+	  is.na(infernal),
+	  NA,
+	  infernal %>%
+		str_split("`") %>%
+		map_chr(~ paste0(unique(str_extract(.x, "^[^\\^]+")), collapse = ","))
+	)
+  ) %>%
+  mutate(across(where(is.character), ~ na_if(.x, "")))
+
+merged_anno %>%
+  write_tsv("filtered_transcripts_description_combined.tsv")
+
+merged_anno %>%
+	mutate(
+	description = case_when(
+	  !is.na(PKA1H1_description) ~ PKA1H1_description,
+	  !is.na(sprot_Top_BLASTX_hit) ~ sprot_Top_BLASTX_hit,
+	  !is.na(sprot_Top_BLASTP_hit) ~ sprot_Top_BLASTP_hit,
+	  !is.na(infernal) ~ infernal,
+	  TRUE ~ NA_character_
+	),
+	description_source = case_when(
+	  !is.na(PKA1H1_description) ~ "PKA1H1",
+	  !is.na(sprot_Top_BLASTX_hit) ~ "BLASTX",
+	  !is.na(sprot_Top_BLASTP_hit) ~ "BLASTP",
+	  !is.na(infernal) ~ "Infernal",
+	  TRUE ~ NA_character_
+	)
+  ) %>%
+  select(
+	gene,
+	description,
+	description_source
+  ) %>%
+  arrange(desc(!is.na(description))) %>%
+  write_tsv("filtered_transcripts_description_combined_brief.tsv")
+```
+
+# Generate datasets of interest
+
+```{R,eval=F}
+library(consensusDE)
+library(tidyverse)
+library(readxl)
+library(SummarizedExperiment)
+library(edgeR)  # for cpm()
+library(tidyverse)
+
+
+# Expression data
+se <- readRDS("summarized_de_filter.rds")
+
+# Heat-related metadata - use GSEA results to filter for heat-related transcripts
+# Ensure transcript IDs are rownames and match your heat-related set
+heat_transcripts <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/go_combined.tsv") %>%
+  filter(desc %in% c("response to heat")) %>%
+  select(transcript_id) %>%
+  distinct() # this third dataset has a more curated list of GO terms related to heat stress (https://www.nature.com/articles/s41467-021-24814-1#Sec9)
+
+# SICAvar - use annotation to grep for SICAvar transcripts
+sicavar <- read_tsv("filtered_transcripts_description_combined_brief.tsv") %>%
+	filter(str_detect(description, "SICA")) %>%
+	select(gene, description) %>%
+	distinct()
+
+# Kir - use annotation to grep for Kir transcripts
+kir <- read_tsv("filtered_transcripts_description_combined_brief.tsv") %>%
+	filter(str_detect(description, "KIR")) %>%
+	select(gene, description) %>%
+	distinct() 
+
+write_tsv(heat_transcripts, "heat_transcripts.tsv")
+write_tsv(sicavar, "sicavar_transcripts.tsv")
+write_tsv(kir, "kir_transcripts.tsv")
+```
+
+## Gametocyte data - a little more convoluted
+
+https://www.science.org/doi/10.1126/science.adj4088#supplementary-materials
+Using MalariaAtlas data and methods (25%) to extract gametocyte transcripts that they have defined.
+Any gene not expressed in asexual stages (at any level) and in >= 25% of gametocyte cells (>0.5CPM) is considered a gametocyte marker.
+
+```{python,eval=F}
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Load data
+adata = sc.read("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pf_ref/scaden_input_pf.h5ad")
+adata.obs["cell_type"] = adata.obs["STAGE_HR"]
+
+# Thresholds
+min_prop_gametocyte = 0.25  # include if ≥25% of gametocyte cells express
+min_prop_asexual = 0.1     # exclude if ≥X% of asexual cells express
+min_exp_filter = 0.5        # expression threshold (gametocyte only)
+
+# Define stages
+gam_stages = ["gametocyte (female)", "gametocyte (male)", "gametocyte (developing)"]
+asexual_stages = ["ring", "trophozoite", "schizont"]
+all_stages = gam_stages + asexual_stages
+
+# Store results
+data = []
+
+for stage in all_stages:
+    cells = adata.obs["cell_type"] == stage
+    X_stage = adata.X[cells]
+    if hasattr(X_stage, "toarray"):
+        X_stage = X_stage.toarray()
+
+    expressed = X_stage > 0
+    prop_expr = expressed.mean(axis=0)
+    avg_expr = X_stage.mean(axis=0)
+
+    prefix = stage.lower().replace(" ", "_").replace("(", "").replace(")", "")
+    data.append(pd.DataFrame({
+        "gene_id": adata.var_names,
+        f"{prefix}_expressed": np.where(prop_expr >= min_prop_gametocyte, "y", ""),
+        f"{prefix}_prop": prop_expr,
+        f"{prefix}_exp": avg_expr
+    }))
+
+# Merge into core table
+core_table = data[0]
+for df in data[1:]:
+    core_table = core_table.merge(df, on="gene_id")
+
+# Save full table
+core_table.to_csv("gametocyte_core_genes_thresholded.csv", index=False)
+
+# Column helper
+def col(stage, suffix): return stage.lower().replace(" ", "_").replace("(", "").replace(")", "") + f"_{suffix}"
+
+# Exclude if expressed in any asexual stage
+asexual_expr_filter = (
+    (core_table[col("ring", "prop")] >= min_prop_asexual) |
+    (core_table[col("trophozoite", "prop")] >= min_prop_asexual) |
+    (core_table[col("schizont", "prop")] >= min_prop_asexual)
+)
+
+# Include gametocyte genes if expressed in any stage AND have expression > 0.5
+gam_expr_filter = (
+    (
+        (core_table[col("gametocyte (female)", "expressed")] == "y") |
+        (core_table[col("gametocyte (male)", "expressed")] == "y") |
+        (core_table[col("gametocyte (developing)", "expressed")] == "y")
+    ) &
+    (
+        (core_table[col("gametocyte (female)", "exp")] > min_exp_filter) |
+        (core_table[col("gametocyte (male)", "exp")] > min_exp_filter) |
+        (core_table[col("gametocyte (developing)", "exp")] > min_exp_filter)
+    ) &
+    ~asexual_expr_filter
+)
+
+gam_total = core_table[gam_expr_filter]
+
+# Stage-specific markers
+female_only = (
+    (core_table[col("gametocyte (female)", "expressed")] == "y") &
+    (core_table[col("gametocyte (female)", "exp")] > min_exp_filter) &
+    (core_table[col("gametocyte (male)", "expressed")] != "y") &
+    (core_table[col("gametocyte (developing)", "expressed")] != "y") &
+    ~asexual_expr_filter
+)
+
+male_only = (
+    (core_table[col("gametocyte (male)", "expressed")] == "y") &
+    (core_table[col("gametocyte (male)", "exp")] > min_exp_filter) &
+    (core_table[col("gametocyte (female)", "expressed")] != "y") &
+    (core_table[col("gametocyte (developing)", "expressed")] != "y") &
+    ~asexual_expr_filter
+)
+
+dev_only = (
+    (core_table[col("gametocyte (developing)", "expressed")] == "y") &
+    (core_table[col("gametocyte (developing)", "exp")] > min_exp_filter) &
+    (core_table[col("gametocyte (female)", "expressed")] != "y") &
+    (core_table[col("gametocyte (male)", "expressed")] != "y") &
+    ~asexual_expr_filter
+)
+
+# Save marker lists
+gam_total["gene_id"].to_csv("gametocyte_total_markers.txt", index=False, header=False)
+core_table[female_only]["gene_id"].to_csv("gametocyte_female_markers.txt", index=False, header=False)
+core_table[male_only]["gene_id"].to_csv("gametocyte_male_markers.txt", index=False, header=False)
+core_table[dev_only]["gene_id"].to_csv("gametocyte_developing_markers.txt", index=False, header=False)
+
+print("[DONE] Gametocyte marker lists written (asexual-expressed genes excluded, expression > 0.5).")
+```
+
+```{R,eval=F}
+library(tidyverse)
+
+# Extract gene_ids for transcripts in assembly that have PKA1H1 annotation
+annotated_from_assembly <- read_tsv("filtered_genes_description.txt", col_names = FALSE) %>%
+  select(X9) %>%
+  mutate(trinity = str_extract(X9, 'gene_id\\s+\\"(TRINITY[^"]+)') %>% str_remove('gene_id\\s+\\"')) %>%
+  select(trinity) %>%
+  mutate(trinity = str_remove(trinity, "_i.*")) %>%
+  distinct()  # remove duplicate entries for the same gene
+
+
+# A1H1 Map
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+	col_names = FALSE, 
+	comment = "#")
+
+colnames(tracking)[c(1, 3, 5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+		a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+		trinity = str_remove(trinity, "\\.path1.*"),
+		trinity = str_remove(trinity, "_i..*")) %>%
+	unique()
+
+# 3D7 Map
+ortholog_map <- read.table("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pf_ref/orthologs_pk_pf.txt", sep = "\t", header = TRUE) %>%
+  rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+  dplyr::select(Gene_ID_Pk, Gene_ID_Pf) %>%
+  tibble()  
+
+# Combine maps and filter to annotated transcripts
+ortholog_map <- a1h1_map %>%
+	dplyr::rename(Gene_ID_Pk = a1h1) %>%
+	left_join(ortholog_map) %>%
+	na.omit() %>%
+	unique() %>%
+	filter(trinity %in% annotated_from_assembly$trinity)
+
+# Use malariaAtlas data to get gametocyte transcripts IDs
+## Subset to gametocyte transcripts Trinity IDs
+# Load gametocyte gene sets and tag with dataset
+gametocyte_files <- list.files(pattern = "^gametocyte_.*\\.txt$")
+
+gametocyte_long <- map_dfr(gametocyte_files, function(file) {
+	genes <- read_lines(file)
+	dataset <- str_remove(file, "^gametocyte_genes_")
+	dataset <- str_remove(dataset, "\\.txt$")
+	tibble(Gene_ID_Pf = genes, dataset = dataset)
+	}) %>%
+	mutate(Gene_ID_Pf = str_replace(Gene_ID_Pf, "-", "_"))
+
+
+# Merge with ortholog map to get Trinity and PKA1H1 IDs
+gametocyte_annotated <- gametocyte_long %>%
+	left_join(ortholog_map, by = "Gene_ID_Pf") %>%
+	filter(!is.na(trinity)) %>%
+	distinct() %>% 
+	select(dataset, trinity) %>%
+	unique() 
+
+# Optional: Save final annotated output
+write_tsv(gametocyte_annotated, "gametocyte_transcripts_combined.tsv")
+```
+
+# Rob Moons paper 
+https://www.pnas.org/doi/10.1073/pnas.1522469113#supplementary-materials
+
+```{R,eval=F}
+library(tidyverse)
+
+# Extract gene_ids for transcripts in assembly that have PKA1H1 annotation
+annotated_from_assembly <- read_tsv("filtered_genes_description.txt", col_names = FALSE) %>%
+  select(X9) %>%
+  mutate(trinity = str_extract(X9, 'gene_id\\s+\\"(TRINITY[^"]+)') %>% str_remove('gene_id\\s+\\"')) %>%
+  select(trinity) %>%
+  mutate(trinity = str_remove(trinity, "_i.*")) %>%
+  distinct()  # remove duplicate entries for the same gene
+
+
+# A1H1 Map
+tracking <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/Trinity_annot.tracking", 
+	col_names = FALSE, 
+	comment = "#")
+
+colnames(tracking)[c(1, 3, 5)] <- c("tracking_id", "a1h1", "trinity")
+
+a1h1_map <- tracking %>%
+	select(a1h1, trinity) %>%
+	mutate(a1h1 = na_if(a1h1, "-"),
+		a1h1 = str_remove(a1h1, "\\|.*")) %>%
+	na.omit() %>%
+	mutate(trinity = str_remove(trinity, "q1:"),
+		trinity = str_remove(trinity, "\\.path1.*"),
+		trinity = str_remove(trinity, "_i..*")) %>%
+	unique()
+	
+read_tsv("rob_moon.tsv") %>%
+	dplyr::rename(a1h1 = Gene_id) %>%
+	left_join(a1h1_map) %>%
+	select(a1h1, trinity, Gene_name) %>%
+	unique() %>%
+	write_tsv("rob_moon_transcripts.tsv", col_names = TRUE)
+```
+
+
+# SICAvar
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+library(viridis)
+
+# Heatmap function
+
+plot_subset_heatmap <- function(se, transcript_ids, subset_name = "subset", group_labeller = NULL) {
+	library(edgeR)
+	library(tidyverse)
+	library(viridis)
+
+	# Subset SE
+	se_subset <- se[rownames(se) %in% transcript_ids, ]
+
+	# Extract raw counts
+	counts <- assay(se_subset, "counts")
+
+	# Filter out samples with zero library size
+	lib_sizes <- colSums(counts)
+	if (any(lib_sizes == 0)) {
+	message("Removing ", sum(lib_sizes == 0), " samples with 0 total counts.")
+	counts <- counts[, lib_sizes > 0]
+	}
+
+	# Log-CPM normalization
+	logCPM <- cpm(counts, log = TRUE, prior.count = 1)
+
+	# Filter: count >10 in ≥30% of samples
+	keep <- rowSums(counts > 10) >= ceiling(ncol(counts) * 0.3)
+	logCPM_filtered <- logCPM[keep, , drop = FALSE]
+
+	if (nrow(logCPM_filtered) < 2) {
+		warning("Too few transcripts after filtering. Heatmap not generated.")
+		return(NULL)
+	}
+
+	# Z-score per gene
+	z_mat <- t(scale(t(logCPM_filtered)))
+
+	# Cluster rows and columns
+	gene_order <- hclust(dist(z_mat))$order
+	sample_order <- hclust(dist(t(z_mat)))$order
+	ordered_genes <- rownames(z_mat)[gene_order]
+	ordered_samples <- colnames(z_mat)[sample_order]
+
+	# Metadata
+	meta <- as.data.frame(colData(se_subset)) %>%
+		rownames_to_column("sample")
+
+	# Reshape to long format
+	plot_df <- z_mat %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "sample", values_to = "zscore") %>%
+		left_join(meta, by = "sample") %>%
+		mutate(
+		gene = factor(gene, levels = ordered_genes),
+		sample = factor(sample, levels = ordered_samples)
+		)
+
+	# Use custom or default facet labels
+	facet_labels <- group_labeller %||% c(Sm = "Severe", Um = "Uncomplicated")
+
+	# Generate plot
+	p <- ggplot(plot_df, aes(x = sample, y = gene, fill = zscore)) +
+		geom_tile(color = "grey90") +
+		scale_fill_viridis_c(option = "D", name = "Z-score") +
+		facet_grid(~group, scales = "free_x", space = "free_x",
+				labeller = as_labeller(facet_labels)) +
+		theme(
+			axis.text.x = element_blank(),
+			axis.text.y = element_blank(),
+			axis.ticks = element_blank(),
+			panel.grid = element_blank(),
+			strip.text = element_text(size = 12),
+			axis.text  = element_text(size = 14),
+			axis.title = element_text(size = 16),
+			legend.text = element_text(size = 14),
+			legend.title = element_text(size = 16)
+		) +
+		ylab(paste0(subset_name, " Genes")) +
+		xlab("Samples")
+
+	return(p)
+}
+
+# Load filtered SICAvar object
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+sicavar <- read_tsv("sicavar_transcripts.tsv")
+
+# Deduplicate IDs
+sica_ids <- sicavar %>%
+	distinct(gene) %>%
+	pull(gene)
+
+
+# Generate heatmap
+p_sica <- plot_subset_heatmap(se, sica_ids, subset_name = "SICAvar")
+
+ggsave("heatmap_sicavar_expression.png", plot = p_sica, dpi = 300, width = 12, height = 6)
+
+
+# Summary heatmap 
+plot_grouped_heatmap <- function(se, transcript_ids, subset_name = "subset", group_col = "group", group_labels = NULL) {
+
+	# Subset to target genes
+	se_subset <- se[rownames(se) %in% transcript_ids, ]
+	counts <- assay(se_subset, "counts")
+
+	# Filter out samples with zero library size
+	lib_sizes <- colSums(counts)
+	if (any(lib_sizes == 0)) {
+		message("Removing ", sum(lib_sizes == 0), " samples with 0 total counts.")
+		counts <- counts[, lib_sizes > 0]
+		se_subset <- se_subset[, lib_sizes > 0]
+	}
+
+	# Log-CPM normalization
+	logCPM <- cpm(counts, log = TRUE, prior.count = 1)
+
+	# Filter: keep transcripts with count >10 in ≥30% of samples
+	keep <- rowSums(counts > 10) >= ceiling(ncol(counts) * 0.3)
+	logCPM_filtered <- logCPM[keep, , drop = FALSE]
+	se_subset <- se_subset[keep, ]
+
+	if (nrow(logCPM_filtered) < 2) {
+		warning("Too few transcripts remaining after filtering. Heatmap not generated.")
+		return(NULL)
+	}
+
+	# Z-score normalize across samples per gene
+	z_mat <- t(scale(t(logCPM_filtered)))
+
+	# Extract group info
+	meta <- as.data.frame(colData(se_subset)) %>%
+		rownames_to_column("sample")
+	sample_groups <- meta %>% select(sample, group = !!sym(group_col))
+
+	# Long format with Z-scores
+	z_long <- z_mat %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "sample", values_to = "zscore") %>%
+		left_join(sample_groups, by = "sample")
+
+	# Average Z-score per group
+	avg_z_by_group <- z_long %>%
+		group_by(gene, group) %>%
+		summarise(mean_z = mean(zscore), .groups = "drop") %>%
+		pivot_wider(names_from = group, values_from = mean_z)
+
+	# Sort genes by Z-score in "Sm" (or other specified group)
+	sm_col <- "Sm"
+	if (!sm_col %in% colnames(avg_z_by_group)) {
+		stop("Group 'Sm' not found in data. Please check group_col and group labels.")
+	}
+
+	ordered_genes <- avg_z_by_group %>%
+		arrange(desc(!!sym(sm_col))) %>%
+		pull(gene) %>%
+		rev()
+
+	# Prepare heatmap matrix
+	z_avg_mat <- avg_z_by_group %>%
+		column_to_rownames("gene") %>%
+		as.matrix()
+
+	# Reshape for plotting
+	plot_df <- z_avg_mat %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "group", values_to = "zscore") %>%
+		mutate(gene = factor(gene, levels = ordered_genes))
+
+	# Custom or default group labels
+	facet_labels <- group_labels %||% c(Sm = "Severe", Um = "Uncomplicated")
+
+	# Plot
+	p <- ggplot(plot_df, aes(x = group, y = gene, fill = zscore)) +
+		geom_tile(color = "grey90") +
+		scale_fill_viridis_c(option = "D", name = "Z-score") +
+		theme(
+		axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+		axis.text.y = element_blank(),
+		axis.ticks = element_blank(),
+		panel.grid = element_blank(),
+		axis.title = element_text(size = 14),
+		legend.position = "left"
+		) +
+		ylab(paste0(subset_name, " Genes")) +
+		xlab("Group")
+
+	return(p)
+}
+
+p_avg_sica <- plot_grouped_heatmap(se, sica_ids, subset_name = "SICAvar")
+ggsave("heatmap_sicavar_grouped_2.png", plot = p_avg_sica, dpi = 300, width = 4, height = 8)
+
+
+summarize_subset_expression <- function(se, transcript_ids, subset_name = "subset", group_col = "group") {
+	filter_and_normalize <- function(se, transcript_ids, min_count = 10, min_prop = 0.3) {
+	se_subset <- se[rownames(se) %in% transcript_ids, ]
+
+	# Drop samples with zero library size
+	counts <- assay(se_subset, "counts")
+	lib_sizes <- colSums(counts)
+	if (any(lib_sizes == 0)) {
+		message("Removing ", sum(lib_sizes == 0), " samples with 0 total counts.")
+		nonzero_samples <- lib_sizes > 0
+		counts <- counts[, nonzero_samples]
+		se_subset <- se_subset[, nonzero_samples]
+	}
+
+	# Log-CPM normalize
+	logCPM <- edgeR::cpm(counts, log = TRUE, prior.count = 1)
+
+	# Filter transcripts with low expression
+	min_samples <- ceiling(ncol(logCPM) * min_prop)
+	keep <- rowSums(counts > min_count) >= min_samples
+	logCPM_filtered <- logCPM[keep, , drop = FALSE]
+
+	if (nrow(logCPM_filtered) < 2) {
+		warning("Too few transcripts remaining after filtering.")
+		return(NULL)
+	}
+
+	return(list(logCPM = logCPM_filtered, se_subset = se_subset[keep, ]))
+	}
+
+	make_expression_long <- function(logCPM, se_subset, group_col = "group") {
+		meta <- as.data.frame(SummarizedExperiment::colData(se_subset)) %>%
+		rownames_to_column("sample") %>%
+		select(sample, group = !!rlang::sym(group_col))
+		logCPM %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "sample", values_to = "logCPM") %>%
+		left_join(meta, by = "sample")
+	}
+
+	average_expression_by_group <- function(expr_long) {
+		expr_long %>%
+		group_by(gene, group) %>%
+		summarise(mean_expr = mean(logCPM), .groups = "drop") %>%
+		pivot_wider(names_from = group, values_from = mean_expr)
+	}
+
+	compute_upregulated_group <- function(avg_by_gene_group) {
+		group_names <- setdiff(names(avg_by_gene_group), "gene")
+		if (length(group_names) != 2) stop("Need exactly two groups")
+		avg_by_gene_group %>%
+		dplyr::rename(Group1 = all_of(group_names[1]),
+						Group2 = all_of(group_names[2])) %>%
+		mutate(
+			up_in = case_when(
+			Group1 > Group2 ~ group_names[1],
+			Group2 > Group1 ~ group_names[2],
+			TRUE ~ "Equal"
+			)
+		)
+	}
+
+	summarize_proportions <- function(df, group1_label = "Group1", group2_label = "Group2") {
+		df %>%
+		dplyr::count(up_in, name = "n") %>%
+		mutate(prop = round(n / sum(n), 3)) %>%
+		arrange(desc(n))
+	}
+
+	compute_sample_stats <- function(expr_long) {
+		expr_long %>%
+		group_by(sample, group) %>%
+		summarise(avg_expr = mean(logCPM), .groups = "drop")
+	}
+
+	test_group_difference <- function(per_sample_df) {
+		wilcox.test(avg_expr ~ group, data = per_sample_df)
+	}
+
+	plot_group_expression <- function(per_sample_df, p_value, subset_name) {
+		ggplot(per_sample_df, aes(x = group, y = avg_expr, fill = group)) +
+			geom_boxplot(outlier.shape = NA) +
+			geom_jitter(width = 0.2, alpha = 0.5) +
+			scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+			labs(y = "Mean logCPM", x = "Group") +
+				annotate("text", x = 1.5, y = max(per_sample_df$avg_expr),
+					label = paste0("p = ", signif(p_value, 3)), size = 5)  +
+		theme(
+			axis.text = element_text(size = 12),
+			axis.title = element_text(size = 14)
+		)
+	}
+
+	count_expressed_samples <- function(expr_long, percentile = 0.9) {
+		# Calculate dynamic threshold from global logCPM distribution
+		logCPM_threshold <- quantile(expr_long$logCPM, probs = percentile, na.rm = TRUE)
+
+		# Count total samples per group (needed for proportion)
+		total_per_group <- expr_long %>%
+			group_by(group) %>%
+			summarise(n_total = n_distinct(sample), .groups = "drop")
+
+		# Compute n and proportion expressed per gene/group
+		expr_counts <- expr_long %>%
+			group_by(gene, group) %>%
+			summarise(
+			n_expressed = sum(logCPM > logCPM_threshold),
+			.groups = "drop"
+			) %>%
+			left_join(total_per_group, by = "group") %>%
+			mutate(prop_expressed = round(n_expressed / n_total, 3)) %>%
+			select(gene, group, n_expressed, prop_expressed)
+
+		# Pivot wider to get separate columns for each group
+		expr_counts %>%
+			pivot_wider(
+			names_from = group,
+			values_from = c(n_expressed, prop_expressed),
+			values_fill = 0
+			)
+	}
+
+	# Compute summed z-score per sample
+	plot_zscore_summary <- function(logCPM, se_subset, group_col, subset_name) {
+		zscore_matrix <- t(scale(t(logCPM)))
+
+		zscore_long <- zscore_matrix %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "sample", values_to = "z") %>%
+		left_join(
+			as.data.frame(SummarizedExperiment::colData(se_subset)) %>%
+			rownames_to_column("sample") %>%
+			select(sample, group = !!rlang::sym(group_col)),
+			by = "sample"
+		)
+
+		zscore_summary <- zscore_long %>%
+		group_by(sample, group) %>%
+		summarise(total_z = sum(z, na.rm = TRUE), .groups = "drop")
+
+		ggplot(zscore_summary, aes(x = group, y = total_z, fill = group)) +
+			geom_boxplot(outlier.shape = NA) +
+			geom_jitter(width = 0.2, alpha = 0.5) +
+			scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+			labs(y = "Summed Z-score", x = "Group") +
+			theme(
+				axis.text = element_text(size = 12),
+				axis.title = element_text(size = 14)
+			)
+	}
+
+	# Run pipeline
+	filtered <- filter_and_normalize(se, transcript_ids)
+	if (is.null(filtered)) return(NULL)
+
+	expr_long <- make_expression_long(filtered$logCPM, filtered$se_subset, group_col)
+	avg_gene_group <- average_expression_by_group(expr_long)
+	with_direction <- compute_upregulated_group(avg_gene_group)
+	prop_table <- summarize_proportions(with_direction)
+	per_sample_df <- compute_sample_stats(expr_long)
+	test_result <- test_group_difference(per_sample_df)
+	p <- plot_group_expression(per_sample_df, test_result$p.value, subset_name)
+	expressed_counts <- count_expressed_samples(expr_long)
+	zscore_boxplot <- plot_zscore_summary(filtered$logCPM, filtered$se_subset, group_col, subset_name)
+
+	return(list(
+		subset = subset_name,
+		mean_expression_by_gene = with_direction,
+		proportion_upregulated = prop_table,
+		per_sample_averages = per_sample_df,
+		wilcoxon_test = test_result,
+		boxplot = p,
+    	samples_expressing_per_gene = expressed_counts,
+		zscore_boxplot = zscore_boxplot
+	))
+}
+
+sica_summary <- summarize_subset_expression(se, sica_ids, subset_name = "SICAvar")
+
+sica_summary$mean_expression_by_gene %>% 
+	arrange(up_in, desc(Group2)) %>% 
+	left_join(sica_summary$samples_expressing_per_gene) %>%
+	write_tsv("sica_expression_summary_mean_90th_percentile.tsv")
+
+sica_summary$proportion_upregulated
+sica_summary$wilcoxon_test
+sica_summary$samples_expressing_per_gene
+
+sica_summary$zscore_boxplot
+
+ggsave("boxplot_sicavar_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+ggsave("boxplot_sicavar_expression.png", plot = sica_summary$boxplot, dpi = 300)
+readr::write_tsv(sica_summary$proportion_upregulated, "sica_proportions.txt")
+capture.output(sica_summary$wilcoxon_test, file = "sica_wilcox_test.txt")
+```
+
+# Kir 
+
+```{R,eval=F}
+# Load data
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+kir <- read_tsv("kir_transcripts.tsv")
+
+# Deduplicate IDs
+kir_ids <- kir %>%
+	distinct(gene) %>%
+	pull(gene)
+
+# Generate heatmap
+p_kir <- plot_subset_heatmap(se, kir_ids, subset_name = "KIR")
+ggsave("heatmap_kir_expression.png", plot = p_kir, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_kir <- plot_grouped_heatmap(se, kir_ids, subset_name = "KIR")
+ggsave("heatmap_kir_grouped.png", plot = p_avg_kir, dpi = 300, width = 6, height = 8)
+
+# Summary and analysis
+kir_summary <- summarize_subset_expression(se, kir_ids, subset_name = "KIR")
+
+kir_summary$proportion_upregulated
+kir_summary$wilcoxon_test
+
+export_plot <- kir_summary$boxplot
+ggsave("boxplot_kir_expression.png", plot = export_plot, dpi = 300)
+ggsave("boxplot_kir_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+readr::write_tsv(kir_summary$proportion_upregulated, "kir_proportions.txt")
+capture.output(kir_summary$wilcoxon_test, file = "kir_wilcox_test.txt")
+```
+
+# Heat/stress-related transcripts
+
+```{R,eval=F}
+# Load data
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+heat <- read_tsv("heat_transcripts.tsv")
+
+# Deduplicate IDs
+heat_ids <- heat %>%
+	distinct(transcript_id) %>%
+	pull(transcript_id)
+
+# Generate heatmap
+p_heat <- plot_subset_heatmap(se, heat_ids, subset_name = "Heat-related")
+ggsave("heatmap_heat_expression.png", plot = p_heat, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_heat <- plot_grouped_heatmap(se, heat_ids, subset_name = "Heat-related")
+ggsave("heatmap_heat_grouped.png", plot = p_avg_heat, dpi = 300, width = 6, height = 8)
+
+# Summary and analysis
+heat_summary <- summarize_subset_expression(se, heat_ids, subset_name = "Heat-related")
+
+heat_summary$proportion_upregulated
+heat_summary$wilcoxon_test
+
+export_plot <- heat_summary$boxplot
+ggsave("boxplot_heat_expression.png", plot = export_plot, dpi = 300)
+ggsave("boxplot_heat_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+readr::write_tsv(heat_summary$proportion_upregulated, "heat_proportions.txt")
+capture.output(heat_summary$wilcoxon_test, file = "heat_wilcox_test.txt")
+```
+
+# Gametocytes
+
+```{R,eval=F}
+# Load SummarizedExperiment object
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+
+# Load annotated marker file
+gametocyte_df <- read_tsv("gametocyte_transcripts_combined.tsv") %>%
+  distinct(transcript_id = trinity, dataset)
+
+gametocyte_df %>% 
+	group_by(dataset) %>% 
+	summarise(n = n())
+
+# gametocyte_total_markers
+
+# Generate heatmap
+gametocyte_ids <- gametocyte_df %>% 
+	filter(dataset == "gametocyte_total_markers") %>%
+	distinct(transcript_id) %>%
+	pull(transcript_id)
+
+p_gametocyte <- plot_subset_heatmap(se, gametocyte_ids, subset_name = "Gametocyte (total)")
+ggsave("heatmap_gametocyte_total_expression.png", plot = p_gametocyte, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_gametocyte <- plot_grouped_heatmap(se, gametocyte_ids, subset_name = "Gametocyte (total)")
+ggsave("heatmap_gametocyte_total_grouped.png", plot = p_avg_gametocyte, dpi = 300, width = 6, height = 12)
+
+# Summary and analysis
+gametocyte_summary <- summarize_subset_expression(se, gametocyte_ids, subset_name = "Gametocyte (total)")
+
+gametocyte_summary$proportion_upregulated
+gametocyte_summary$wilcoxon_test
+
+export_plot <- gametocyte_summary$boxplot
+ggsave("boxplot_gametocyte_total_expression.png", plot = export_plot, dpi = 300)
+ggsave("boxplot_gametocyte_total_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+readr::write_tsv(gametocyte_summary$proportion_upregulated, "gametocyte_total_proportions.txt")
+capture.output(gametocyte_summary$wilcoxon_test, file = "gametocyte_wilcox_test.txt")
+
+# gametocyte_female_markers
+
+# Generate heatmap
+gametocyte_ids_female <- gametocyte_df %>% 
+	filter(dataset == "gametocyte_female_markers") %>%
+	distinct(transcript_id) %>%
+	pull(transcript_id)
+
+p_gametocyte_female <- plot_subset_heatmap(se, gametocyte_ids_female, subset_name = "Gametocyte (female)")
+ggsave("heatmap_gametocyte_female_expression.png", plot = p_gametocyte_female, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_gametocyte_female <- plot_grouped_heatmap(se, gametocyte_ids_female, subset_name = "Gametocyte (female)")
+ggsave("heatmap_gametocyte_female_grouped.png", plot = p_avg_gametocyte_female, dpi = 300, width = 6, height = 12)
+
+# Summary and analysis
+gametocyte_summary_female <- summarize_subset_expression(se, gametocyte_ids_female, subset_name = "Gametocyte (female)")
+
+gametocyte_summary_female$proportion_upregulated
+gametocyte_summary_female$wilcoxon_test
+
+export_plot_female <- gametocyte_summary_female$boxplot
+ggsave("boxplot_gametocyte_female_expression.png", plot = export_plot_female, dpi = 300)
+ggsave("boxplot_gametocyte_female_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+readr::write_tsv(gametocyte_summary_female$proportion_upregulated, "gametocyte_female_proportions.txt")
+capture.output(gametocyte_summary_female$wilcoxon_test, file = "gametocyte_female_wilcox_test.txt")
+
+# gametocyte_male_markers
+
+# Generate heatmap
+gametocyte_ids_male <- gametocyte_df %>% 
+	filter(dataset == "gametocyte_male_markers") %>%
+	distinct(transcript_id) %>%
+	pull(transcript_id)
+
+p_gametocyte_male <- plot_subset_heatmap(se, gametocyte_ids_male, subset_name = "Gametocyte (male)")
+ggsave("heatmap_gametocyte_male_expression.png", plot = p_gametocyte_male, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_gametocyte_male <- plot_grouped_heatmap(se, gametocyte_ids_male, subset_name = "Gametocyte (male)")
+ggsave("heatmap_gametocyte_male_grouped.png", plot = p_avg_gametocyte_male, dpi = 300, width = 6, height = 12)
+
+# Summary and analysis
+gametocyte_summary_male <- summarize_subset_expression(se, gametocyte_ids_male, subset_name = "Gametocyte (male)")
+
+gametocyte_summary_male$proportion_upregulated
+gametocyte_summary_male$wilcoxon_test
+
+export_plot_male <- gametocyte_summary_male$boxplot
+ggsave("boxplot_gametocyte_male_expression.png", plot = export_plot_male, dpi = 300)
+ggsave("boxplot_gametocyte_male_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+readr::write_tsv(gametocyte_summary_male$proportion_upregulated, "gametocyte_male_proportions.txt")
+capture.output(gametocyte_summary_male$wilcoxon_test, file = "gametocyte_male_wilcox_test.txt")
+```
+
+# Rob moon
+
+```{R,eval=F}
+# Load summarized experiment
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+
+# Load gene-to-transcript mapping
+moon <- read_tsv("rob_moon_transcripts.tsv") %>%
+  distinct(trinity, Gene_name)
+
+# Collapse to gene level expression
+assay_mat <- assay(se, "counts")
+rownames_present <- intersect(rownames(assay_mat), moon$trinity)
+
+collapsed <- moon %>%
+  filter(trinity %in% rownames_present) %>%
+  group_by(Gene_name) %>%
+  summarise(gene_expr = list(colSums(assay_mat[trinity, , drop = FALSE]))) %>%
+  unnest_wider(gene_expr)
+
+# Convert to matrix
+gene_expr_mat <- collapsed %>%
+  column_to_rownames("Gene_name") %>%
+  as.matrix()
+
+# Ensure column names match original SE
+colnames(gene_expr_mat) <- colnames(se)
+
+# Now construct the gene-level SummarizedExperiment
+gene_se <- SummarizedExperiment(
+  assays = list(counts = gene_expr_mat),
+  colData = colData(se)
+)
+
+# Generate heatmap - before running, regenerate functions with axis.text.y = element_blank() #'d out
+p_heat <- plot_subset_heatmap(gene_se, rownames(gene_expr_mat), subset_name = "Invasion (Moon et al. 2016)")
+ggsave("heatmap_moon_genes.png", plot = p_heat, dpi = 300, width = 12, height = 6)
+
+# Grouped heatmap
+p_avg <- plot_grouped_heatmap(gene_se, rownames(gene_expr_mat), subset_name = "Invasion (Moon et al. 2016)")
+ggsave("heatmap_moon_grouped_2.png", plot = p_avg, dpi = 300, width = 5, height = 8)
+
+# Summary stats
+summary <- summarize_subset_expression(gene_se, rownames(gene_expr_mat), subset_name = "Invasion (Moon et al. 2016)")
+
+summary$proportion_upregulated
+summary$wilcoxon_test
+
+ggsave("boxplot_moon_expression.png", plot = summary$boxplot, dpi = 300)
+ggsave("boxplot_moon_zscore_summed.png", plot = sica_summary$zscore_boxplot, dpi = 300)
+write_tsv(summary$proportion_upregulated, "moon_gene_proportions.txt")
+capture.output(summary$wilcoxon_test, file = "moon_gene_wilcox_test.txt")
+
+# Individual boxplots
+# Create long-form logCPM matrix from gene_se
+logCPM_gene <- edgeR::cpm(assay(gene_se), log = TRUE, prior.count = 1)
+
+logCPM_long <- logCPM_gene %>%
+	as.data.frame() %>%
+	rownames_to_column("gene") %>%
+	pivot_longer(-gene, names_to = "sample", values_to = "logCPM") %>%
+	left_join(as.data.frame(colData(gene_se)) %>%
+				rownames_to_column("sample") %>%
+				select(sample, group), by = "sample")
+
+# Plot: logCPM boxplots per gene
+p_logCPM_multi <- ggplot(logCPM_long, aes(x = group, y = logCPM, fill = group)) +
+	geom_boxplot(outlier.shape = NA) +
+	geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
+	scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+	facet_wrap(~gene, scales = "free_y") +
+	labs(title = "logCPM per Gene", y = "logCPM", x = "Group") +
+	theme(
+		axis.text = element_text(size = 12),
+		axis.title = element_text(size = 14)
+		)
+
+ggsave("boxplots_moon_genes_logCPM.png", plot = p_logCPM_multi, dpi = 300, width = 12, height = 8)
+
+logCPM_long <- logCPM_gene %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "logCPM") %>%
+  left_join(as.data.frame(colData(gene_se)) %>%
+              rownames_to_column("sample") %>%
+              select(sample, group), by = "sample")
+
+# order genes by mean logCPM across all samples - for plotting
+gene_order <- logCPM_long %>%
+  group_by(gene) %>%
+  summarise(mean_logCPM = mean(logCPM, na.rm = TRUE)) %>%
+  arrange(desc(mean_logCPM)) %>%
+  pull(gene)
+
+logCPM_long <- logCPM_long %>%
+  mutate(gene = factor(gene, levels = gene_order))
+
+# logCPM boxplot (grouped by gene)
+p_logCPM <- ggplot(logCPM_long, aes(x = gene, y = logCPM, fill = group)) +
+	geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75), width = 0.6) +
+	geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+				alpha = 0.4, size = 0.8) +
+	scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+	labs(x = "Gene", y = "logCPM") +
+	theme(
+		axis.text = element_text(size = 12),
+		axis.title = element_text(size = 14),
+		axis.text.x = element_text(angle = 90, hjust = 1)
+		)
+
+ggsave("boxplots_moon_genes_logCPM_grouped.png", p_logCPM, dpi = 300, width = 10, height = 6)
+
+
+# Z-score normalization across samples (per gene)
+zscore_mat <- t(scale(t(logCPM_gene)))
+zscore_long <- zscore_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "z") %>%
+  left_join(as.data.frame(colData(gene_se)) %>%
+              rownames_to_column("sample") %>%
+              select(sample, group), by = "sample")
+
+# Order genes by mean logCPM (used previously)
+gene_order_logCPM <- logCPM_long %>%
+  group_by(gene) %>%
+  summarise(mean_logCPM = mean(logCPM, na.rm = TRUE)) %>%
+  arrange(desc(mean_logCPM)) %>%
+  pull(gene)
+
+# Apply this order to z-score plot too
+zscore_long <- zscore_long %>%
+  mutate(gene = factor(gene, levels = gene_order_logCPM))
+
+# Z-score boxplot (grouped by gene)
+p_zscore <- ggplot(zscore_long, aes(x = gene, y = z, fill = group)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.75), width = 0.6) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75),
+              alpha = 0.4, size = 0.8) +
+  scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+  labs(x = "Gene", y = "Z-score") +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  ) +
+  coord_cartesian(ylim = c(-3, 3))
+
+ggsave("boxplots_moon_genes_zscore_grouped.png", p_zscore, dpi = 300, width = 10, height = 6)
+```
+
+
+# Outlier group
+
+## Selected a "neutral" GO term for outlier analysis - low NES and p-value
+
+gsea_result <- GSEA(geneList = gene_list,
+                    TERM2GENE = term2gene,
+                    TERM2NAME = term2name,
+                    pvalueCutoff = 0.01,
+                    verbose = TRUE)
+
+gsea_result@result %>%
+	arrange(abs(NES)) %>%
+	select(ID, Description, NES, p.adjust) %>%
+	filter(p.adjust >=0.05) %>%
+	arrange(desc(p.adjust)) %>%
+	head(10)
+
+```{R,eval=F}
+library(consensusDE)
+library(tidyverse)
+library(readxl)
+library(SummarizedExperiment)
+library(edgeR)  # for cpm()
+library(tidyverse)
+
+
+# Expression data
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+
+# Ensure transcript IDs are rownames and match your heat-related set
+outlier_transcripts <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/go_combined.tsv") %>%
+  filter(GO_term %in% c("GO:0002161")) %>%
+  select(transcript_id) %>%
+  distinct()
+
+write_tsv(outlier_transcripts, "outlier_transcripts.tsv")
+
+# Read in data
+outlier <- read_tsv("outlier_transcripts.tsv")
+
+# Deduplicate IDs
+outlier_ids <- outlier %>%
+	distinct(transcript_id) %>%
+	pull(transcript_id)
+
+# Generate heatmap
+p_outlier <- plot_subset_heatmap(se, outlier_ids, subset_name = "cytoplasmic stress granule")
+ggsave("heatmap_outlier_expression.png", plot = p_outlier, dpi = 300, width = 12, height = 6)
+
+# Heatmap grouped
+p_avg_outlier <- plot_grouped_heatmap(se, outlier_ids, subset_name = "cytoplasmic stress granule")
+ggsave("heatmap_outlier_grouped.png", plot = p_avg_outlier, dpi = 300, width = 6, height = 8)
+
+# Summary and analysis
+outlier_summary <- summarize_subset_expression(se, outlier_ids, subset_name = "cytoplasmic stress granule")
+
+outlier_summary$proportion_upregulated
+outlier_summary$wilcoxon_test
+
+export_plot <- outlier_summary$boxplot
+ggsave("boxplot_outlier_expression.png", plot = export_plot, dpi = 300)
+ggsave("boxplot_outlier_zscore_summed.png", plot = outlier_summary$zscore_boxplot, dpi = 300)
+```
+
+
+# Additional analyses/checks
+
+```{R,eval=F}
+library(tidyverse)
+library(SummarizedExperiment)
+library(edgeR)
+library(viridis)
+
+# Load filtered SICAvar object
+se <- readRDS("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/de_covar/um_control/custom_1cpm_10_samples_ruv/summarized_de_filter.rds")
+sicavar <- read_tsv("sicavar_transcripts.tsv")
+
+# Deduplicate IDs
+sica_ids <- sicavar %>%
+	distinct(gene) %>%
+	pull(gene)
+
+# Filter and normalize function
+filter_and_normalize <- function(se, transcript_ids, min_count = 10, min_prop = 0.3) {
+	se_subset <- se[rownames(se) %in% transcript_ids, ]
+	counts <- assay(se_subset, "counts")
+
+	lib_sizes <- colSums(counts)
+	if (any(lib_sizes == 0)) {
+		message("Removing ", sum(lib_sizes == 0), " samples with 0 total counts.")
+		nonzero_samples <- lib_sizes > 0
+		counts <- counts[, nonzero_samples]
+		se_subset <- se_subset[, nonzero_samples]
+	}
+
+	logCPM <- edgeR::cpm(counts, log = TRUE, prior.count = 1)
+	min_samples <- ceiling(ncol(logCPM) * min_prop)
+	keep <- rowSums(counts > min_count) >= min_samples
+	logCPM_filtered <- logCPM[keep, , drop = FALSE]
+
+	if (nrow(logCPM_filtered) < 2) {
+		warning("Too few transcripts remaining after filtering.")
+		return(NULL)
+	}
+
+	list(logCPM = logCPM_filtered, se_subset = se_subset[keep, ])
+}
+
+# Z-score boxplot with parasitemia overlay
+plot_zscore_summary <- function(logCPM, se_subset, group_col, subset_name) {
+	zscore_matrix <- t(scale(t(logCPM)))
+
+	zscore_long <- zscore_matrix %>%
+		as.data.frame() %>%
+		rownames_to_column("gene") %>%
+		pivot_longer(-gene, names_to = "sample", values_to = "z") %>%
+		left_join(
+		as.data.frame(SummarizedExperiment::colData(se_subset)) %>%
+			rownames_to_column("sample") %>%
+			select(sample, group = !!rlang::sym(group_col), parasitemia),
+		by = "sample"
+		)
+
+	zscore_summary <- zscore_long %>%
+		group_by(sample, group, parasitemia) %>%
+		summarise(total_z = sum(z, na.rm = TRUE), .groups = "drop")
+
+	p <- ggplot(zscore_summary, aes(x = group, y = total_z, fill = group)) +
+		geom_boxplot(outlier.shape = NA) +
+		geom_jitter(aes(color = parasitemia), width = 0.2, alpha = 0.6, size = 1) +
+		scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+		scale_color_viridis_c(option = "C", name = "Parasitemia") +
+		labs(y = "Summed Z-score", x = "Group") +
+		theme(
+		axis.text = element_text(size = 12),
+		axis.title = element_text(size = 14)
+		)
+
+	ggsave(paste0("boxplot_", tolower(subset_name), "_zscore_parasitemia.png"), plot = p, dpi = 300, width = 7, height = 5)
+	return(p)
+}
+
+# Run
+filtered <- filter_and_normalize(se, sica_ids)
+plot_zscore_summary(filtered$logCPM, filtered$se_subset, group_col = "group", subset_name = "SICAvar")
+
+
+# Extract parasitemia and group info
+meta_df <- as.data.frame(colData(se)) %>%
+  rownames_to_column("sample") %>%
+  select(sample, group, parasitemia) %>%
+  filter(!is.na(parasitemia), !is.na(group))
+
+# Generate boxplot
+p_parasitemia <- ggplot(meta_df, aes(x = group, y = parasitemia, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +
+	geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+	scale_fill_manual(values = c(Sm = "#440154FF", Um = "#21908CFF")) +
+	labs(x = "Group", y = "Parasitemia") 
+
+# Save the plot
+ggsave("boxplot_parasitemia_by_group.png", plot = p_parasitemia, dpi = 300, width = 6, height = 4)
+
+# Optionally, run a Wilcoxon test
+wilcox.test(parasitemia ~ group, data = meta_df)
+```

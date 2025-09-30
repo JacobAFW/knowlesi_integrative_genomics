@@ -1,0 +1,5 @@
+executor: cluster-generic
+cluster-generic-submit-cmd: "qsub -N {resources.jobname} -l ncpus={resources.ncpus},mem={resources.mem},walltime={resources.walltime},storage={resources.storage} -A {resources.account} -q {resources.queue} -M {resources.email} -m {resources.mailon} -j {resources.jobout} -V -S /bin/sh"
+jobs: 100
+verbose: true
+notemp: true

@@ -1,0 +1,1299 @@
+# IDC Mapping
+
+```{bash,eval=F}
+start_pbs_big_boy
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/scaden/bin/activate 
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping
+```
+
+
+# Using Scaden
+
+https://www.science.org/doi/10.1126/sciadv.aba2619
+
+# Map P. falciparum genes to P. knowlesi, and between knowlesi
+Download orthologs from P. falciparum to P. knowlesi, and for the different knowlesi references (for compatibility with MalariaAtlas)
+left_join to keep only genes that have orthologs in both species
+
+```{R,eval=F}
+library(tidyverse)
+
+orthologs_pk_pf <- read.table("GenesByOrthologPattern_pk.txt", sep = "\t", header = T) %>%
+    rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+    select(Gene_ID, Ortholog_Group) %>%
+    rename(Gene_ID_Pk = Gene_ID) %>%
+    left_join(
+        read.table("GenesByOrthologPattern_pf.txt", sep = "\t", header = T) %>%
+        rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+        select(Gene_ID, Ortholog_Group) %>%
+        rename(Gene_ID_Pf = Gene_ID),
+        by = "Ortholog_Group"
+    ) %>% 
+    group_by(Ortholog_Group) %>%
+    slice(1) %>% 
+    na.omit() 
+
+write_tsv(orthologs_pk_pf, "orthologs_pk_pf.txt")
+
+orthologs_a1h1_nh <- read.table("GenesByOrthologPattern_Summary_a1h1_to_pknh.txt", sep = "\t", header = T) %>%
+    rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+    select(Gene_ID, Ortholog_Group) %>%
+    rename(Gene_ID_a1h1 = Gene_ID) %>% 
+    left_join(
+        read.table("GenesByOrthologPattern_Summary_pknh_to_a1h1.txt", sep = "\t", header = T) %>%
+        rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+        select(Gene_ID, Ortholog_Group) %>%
+        rename(Gene_ID_pknh = Gene_ID),
+        by = "Ortholog_Group"
+    ) %>% 
+    group_by(Ortholog_Group) %>%
+    slice(1) %>% 
+    na.omit() 
+
+write_tsv(orthologs_a1h1_nh, "orthologs_a1h1_pknh.txt")
+```
+
+# Use STAR aligner to get counts mapping to Pk reference genome - Snakemake pipeline
+
+**Rule for de novo pipeline.**
+
+```{python, eval=F}
+# Map to hg with STAR
+
+## Max intron size of Pf is ~1000 & min is 5- specified in input
+
+pfx_hg="output/mapped/human/"
+
+rule star_aligner_hg:
+    input:
+        "output/genome_index/human/Genome",
+        "output/genome_index/human/SA",
+        "output/genome_index/human/SAindex",
+        star=star_path,
+        f_in="output/trimmed/{sample}_trimmed_1.fq.gz",
+        r_in="output/trimmed/{sample}_trimmed_2.fq.gz"
+    output:
+        *[temp(pfx_hg + filename) for filename in [
+            '{sample}_Aligned.sortedByCoord.out.bam',
+            '{sample}_Log.final.out',
+            '{sample}_Log.out',
+            '{sample}_Log.progress.out',
+            '{sample}_SJ.out.tab',
+            '{sample}_ReadsPerGene.out.tab',
+            '{sample}_Unmapped.out.mate1',
+            '{sample}_Unmapped.out.mate2'
+            ]]
+    params:
+        pfx_hg=f"{pfx_hg}{{sample}}_",
+        genome="output/genome_index/human"
+    shell:
+        """
+        {input.star} \
+        --runThreadN 5 \
+        --genomeDir {params.genome} \
+        --readFilesIn {input.f_in} {input.r_in} \
+        --readFilesCommand zcat \
+        --outSAMtype BAM SortedByCoordinate \
+	    --outFileNamePrefix {params.pfx_hg} \
+	    --outSAMattributes Standard \
+        --alignIntronMin 5 \
+        --limitBAMsortRAM 3285941848 \
+        --alignIntronMax 1000 \
+        --quantMode GeneCounts \
+        --outReadsUnmapped Fastx 
+        """
+```
+
+
+# Using Pk reference data from malaria atlas
+
+## Reformat SC data for use with Scaden
+
+https://www.malariacellatlas.org/data-sets/
+P. falciparum 10x (Integrated lab strains and four natural infections)
+
+```{python,eval=F}
+import pandas as pd
+import scanpy as sc
+from anndata import AnnData
+
+# Load your data
+expr = pd.read_csv("pk_ref/pk-ch10x-exp.csv", index_col=0)      # genes × samples
+meta = pd.read_csv("pk_ref/pk-ch10x-data.csv")                  # metadata
+
+# Transpose expression: samples (cells) × genes
+expr_t = expr.T
+expr_t.index.name = "CELL_ID"
+
+# Merge with metadata
+adata_df = expr_t.merge(meta, left_index=True, right_on="CELL_ID")
+
+# Extract expression matrix (cells × genes)
+X = adata_df[expr_t.columns]
+
+# Create AnnData object
+adata = AnnData(X.values)
+adata.obs = adata_df.drop(columns=expr_t.columns).set_index("CELL_ID")
+adata.var_names = expr_t.columns
+adata.obs_names = adata_df["CELL_ID"]
+
+# Set required cell type column (rename if needed)
+adata.obs["cell_type"] = adata.obs["STAGE_LR"]
+
+# Save to H5AD for Scaden
+adata.write("pk_ref/scaden_input_pk.h5ad")
+
+# Create gene list for filtering
+genes = adata.var_names.tolist()
+
+with open("pk_ref/genes_from_h5ad.txt", "w") as f:
+    f.write("\n".join(genes))
+
+# For scaden simulate
+
+# Extract counts
+counts_df = pd.DataFrame(adata.X, index=adata.obs.index, columns=adata.var.index)
+counts_df_reset = counts_df.reset_index()
+counts_df_clean = counts_df_reset.drop(columns=['CELL_ID'])
+counts_df_clean.to_csv("pk_ref/scaden_counts.txt", sep="\t")
+
+# Extract cell types
+celltypes_df = adata.obs['cell_type']
+celltypes_df.to_csv("pk_ref/scaden_celltypes.txt", index=False, header=["Celltype"])
+```
+
+
+
+## Normalise, reformat and filter (by SC) RNA-seq data for Scaden
+Normalize your P. knowlesi expression data to TPM, log2(TPM+1), or variance-stabilized values (like with DESeq2 vst()).
+Subset your data to only include genes that have mapped Pf orthologs.
+
+
+```{R,eval=F}
+library(tidyverse)
+library(GenomicFeatures)
+library(biomaRt)
+library(purrr)
+
+# Set up
+star_dir <- "/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_assembly_2/output/mapped"  # STAR output
+gtf_file <- "/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/PlasmoDB-68_PknowlesiA1H1.gtf"
+use_column <- 4  # STAR column: 4 = stranded reverse (RF)
+output_file <- "pk_ref/scaden_input_tpm.txt"  # <-- Output for Scaden
+
+# Get STAR output files
+star_files <- list.files(star_dir, pattern = "ReadsPerGene.out.tab$", full.names = TRUE)
+
+# Extract gene lengths from GTF
+txdb <- makeTxDbFromGFF(gtf_file)
+gene_lengths <- genes(txdb) %>%
+  as_tibble() %>%
+  mutate(gene_length = width) %>%
+  dplyr::select(gene_id, gene_length)
+
+# Read STAR gene count data
+read_star_file <- function(file, col = use_column) {
+  sample_name <- gsub("_ReadsPerGene.out.tab", "", basename(file))
+  df <- read_tsv(file, col_names = FALSE, skip = 4, show_col_types = FALSE)
+  tibble(gene_id = df$X1, !!sample_name := df[[col]])
+}
+
+# Merge all count tables
+expr_list <- lapply(star_files, read_star_file)
+counts_long <- expr_list[[1]]
+for (i in 2:length(expr_list)) {
+  counts_long <- full_join(counts_long, expr_list[[i]], by = "gene_id")
+}
+counts_long <- drop_na(counts_long)
+
+# Add gene lengths
+counts_long <- counts_long %>%
+  left_join(gene_lengths, by = "gene_id") %>%
+  filter(!is.na(gene_length)) %>%
+  group_by(gene_id) %>%
+  summarize(across(where(is.numeric), sum), gene_length = mean(gene_length), .groups = "drop")
+
+# Convert A1H1 gene IDs to PKNH
+ortholog_map <- read.table("orthologs_a1h1_pknh.txt", sep = "\t", header = TRUE) %>%
+  rename_with(~ str_replace_all(., "\\.", "_")) %>%
+  dplyr::select(Gene_ID_a1h1, Gene_ID_pknh)
+
+counts_long <- counts_long %>%
+  left_join(ortholog_map, by = c("gene_id" = "Gene_ID_a1h1")) %>%
+  filter(!is.na(Gene_ID_pknh)) %>%
+  mutate(gene_id = Gene_ID_pknh) %>%
+  dplyr::select(-Gene_ID_pknh)
+
+# Calculate TPM
+count_cols <- setdiff(names(counts_long), c("gene_id", "gene_length"))
+counts_mat <- as.matrix(counts_long[, count_cols])
+length_kb <- counts_long$gene_length / 1000
+rpk <- sweep(counts_mat, 1, length_kb, FUN = "/")
+scaling_factors <- colSums(rpk) / 1e6
+tpm <- sweep(rpk, 2, scaling_factors, FUN = "/")
+rownames(tpm) <- counts_long$gene_id
+
+# Filter by SC data
+tpm_df <- cbind(Gene = counts_long$gene_id, as.data.frame(tpm))
+sc_genes <- readLines("pk_ref/genes_from_h5ad.txt")  # OR read.table(...)[[1]]
+tpm_df_filtered <- tpm_df %>%
+  filter(Gene %in% sc_genes) %>% 
+  as.data.frame() 
+
+# Save in Scaden format: genes as rows, samples as columns
+write.table(tpm_df_filtered, file = output_file, sep = "\t", quote = FALSE, col.names = TRUE, row.names = FALSE)
+```
+
+
+## Filter SC by bulk 
+
+```{python,eval=F}
+import pandas as pd
+import scanpy as sc
+from anndata import AnnData
+
+adata = sc.read_h5ad("pk_ref/scaden_input_pk.h5ad")
+bulk_genes = set(pd.read_csv("pk_ref/scaden_input_tpm.txt", sep="\t")["Gene"])
+adata = adata[:, adata.var_names.isin(bulk_genes)].copy()
+adata.write("pk_ref/scaden_input_pk_filtered.h5ad")
+```
+
+
+## Run scaden - 10 iterations
+
+```{R,eval=F}
+#!/bin/bash
+#PBS -P pq84
+#PBS -q normalbw
+#PBS -N scaden
+#PBS -j oe
+#PBS -m ae
+#PBS -l walltime=48:00:00,mem=80GB,ncpus=10
+#PBS -l storage=gdata/pq84+scratch/pq84
+#PBS -M jacob.westaway@menzies.edu.au
+
+echo "---------------------------------------"
+echo "PBS: Job identifier is $PBS_JOBID"
+echo "PBS: Job name is $PBS_JOBNAME"
+echo "---------------------------------------"
+
+echo "Sourcing modules and activating environment"
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/scaden/bin/activate 
+
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping
+
+echo "Starting Scaden pipeline"
+set -e
+
+patternRef="scaden"      # *celltypes.txt and *counts.txt files(without extension)
+patternBulk="scaden_input_tpm"             # .txt file (without extension)
+
+dirRef="pk_ref"
+dirBulk="pk_ref"
+dirSimul="temp/scaden_simulated_data"
+dirModel="temp/scaden_trained_models"
+dirPrediction="${dirRef}/scaden_predictions/${patternRef}"
+
+mkdir -p "${dirPrediction}"
+mkdir -p "${dirSimul}"
+mkdir -p "${dirModel}"
+
+for i in $(seq 1 10)
+do
+  echo "Starting iteration $i..."
+
+  echo "Simulating mixtures..."
+  scaden simulate -n 1000 --pattern "*_counts.txt" --data "${dirRef}" --out "$dirSimul"
+
+  echo "Processing data for Scaden..."
+  scaden process "${dirSimul}/${patternRef}.h5ad" "${dirBulk}/${patternBulk}.txt" \
+    --processed_path "${dirSimul}/processed.h5ad"
+
+  echo "Training model..."
+  scaden train "${dirSimul}/processed.h5ad" --steps 5000 --model_dir "$dirModel"
+
+  echo "Predicting cell fractions..."
+  scaden predict --model_dir "$dirModel" "${dirBulk}/${patternBulk}.txt" \
+    --outname "${patternRef}_n${i}"
+
+  echo "Saving prediction: ${patternRef}_n${i} → ${dirPrediction}"
+  mv "${patternRef}_n${i}" "${dirPrediction}"
+
+  echo "Cleaning up"
+  rm -rf "${dirSimul:?}/"*
+  rm -rf "${dirModel:?}/"*
+
+  echo "Finished iteration $i"
+done
+
+echo "---------------------------------------"
+echo "All $((end - start + 1)) iterations completed successfully!"
+echo "Final predictions saved in: ${dirPrediction}"
+echo "---------------------------------------"
+```
+
+
+## Get the mean proportions for each of the 10 iterations
+
+```{R,eval=F}
+library(tidyverse)
+
+# List all prediction files matching pattern
+files <- list.files(pattern = "^scaden_n[0-9]+$", path = "pk_ref/scaden_predictions/scaden", full.names = TRUE)
+
+# Plotting
+# Read in each file and annotate with run number
+scaden_all <- map2_dfr(files, seq_along(files), ~{
+  read.table(.x, header = TRUE, row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("sample_id") %>%
+    pivot_longer(-sample_id, names_to = "cell_type", values_to = "proportion") %>%
+    mutate(run = paste0("run_", .y))
+})
+
+scaden_mean_df <- scaden_all %>%
+  group_by(sample_id, cell_type) %>%
+  summarise(proportion = mean(proportion), .groups = "drop") %>%
+  pivot_wider(names_from = cell_type, values_from = proportion)
+
+write_tsv(scaden_mean_df, "pk_ref/scaden_mean_proportions.txt")
+
+# Plot mean proportions for each sample
+export_plot <- scaden_mean_df %>%
+    arrange(desc(trophozoite)) %>%
+    add_column(plot_id = 1:nrow(.)) %>%
+    pivot_longer(cols = -c(sample_id, plot_id), names_to = "celltype", values_to = "proportion") %>%
+    ggplot(aes(x = plot_id, y = proportion, fill = celltype)) +
+        geom_col() +
+        theme(
+            axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank(),
+            axis.title = element_text(size = 16),
+            axis.text = element_text(size = 14),
+            legend.title = element_text(size = 16),
+            legend.text = element_text(size = 14)  
+        
+        ) +
+        scale_fill_manual(
+            name = "Cell Type",
+            values = c(
+                "ring" = "#d44842",
+                "schizont" = "#73D055FF",
+                "trophozoite" = "#440154FF"
+            )
+        ) +
+        xlab("Sample") +
+        ylab("Proportion of cell type") 
+
+ggsave(export_plot, filename = "pk_ref/scaden_mean_proportions.png", width = 15, height = 6, dpi = 300)
+
+
+# Plot all data points
+export_plot <- ggplot(scaden_all, aes(x = sample_id, y = proportion, color = cell_type)) +
+    geom_point(position = position_jitterdodge(jitter.width = 0.25, dodge.width = 0.6), alpha = 0.7, size = 1.5) +
+    facet_wrap(~cell_type) +
+    labs(
+        x = "Sample ID",
+        y = "Predicted proportion"
+    ) +
+    theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        strip.text = element_text(size = 16)
+    ) +
+    scale_colour_manual(
+        name = "Cell Type",
+        values = c(
+            "ring" = "#d44842",
+            "schizont" = "#73D055FF",
+            "trophozoite" = "#440154FF"
+        )
+    )
+
+ggsave(export_plot, filename = "pk_ref/scaden_all_predictions.png", width = 10, height = 6, dpi = 300)
+
+
+# Calculate summary
+scaden_summary <- scaden_all %>%
+  group_by(sample_id, cell_type) %>%
+  summarise(
+    mean = mean(proportion),
+    sd = sd(proportion),
+    min = min(proportion),
+    max = max(proportion),
+    .groups = "drop"
+  )
+
+#  Scaden Prediction Range per Sample (Min-Max)
+export_plot <- scaden_summary %>%
+  ggplot(aes(x = sample_id, y = mean, colour = cell_type)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = min, ymax = max), width = 0.2) +  # range
+    facet_wrap(~ cell_type) +
+    ylab("Predicted Proportion") +
+    xlab("Sample") +
+    theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        strip.text = element_text(size = 16)
+    ) +
+    scale_colour_manual(
+        values = c(
+            "ring" = "#d44842",
+            "schizont" = "#73D055FF",
+            "trophozoite" = "#440154FF"
+        )
+    )
+
+ggsave(export_plot, filename = "pk_ref/scaden_summary.png", width = 12, height = 6, dpi = 300)
+```
+
+
+
+# Using Pf reference data from malaria atlas
+
+## Reformat SC data for use with Scaden
+
+https://www.malariacellatlas.org/data-sets/
+
+```{python,eval=F}
+import pandas as pd
+import scanpy as sc
+from anndata import AnnData
+
+# Load your data
+expr = pd.read_csv("pf_ref/pf-ch10x-set4-ch10x-exp.csv", index_col=0)      # genes × samples
+meta = pd.read_csv("pf_ref/pf-ch10x-set4-ch10x-data.csv")                  # metadata
+
+# Transpose expression: samples (cells) × genes
+expr_t = expr.T
+expr_t.index.name = "CELL_ID"
+
+# Merge with metadata
+adata_df = expr_t.merge(meta, left_index=True, right_on="CELL_ID")
+
+# Extract expression matrix (cells × genes)
+X = adata_df[expr_t.columns]
+
+# Create AnnData object
+adata = AnnData(X.values)
+adata.obs = adata_df.drop(columns=expr_t.columns).set_index("CELL_ID")
+adata.var_names = expr_t.columns
+adata.obs_names = adata_df["CELL_ID"]
+
+# Set required cell type column (rename if needed)
+adata.obs["cell_type"] = adata.obs["STAGE_HR"]
+
+# Save to H5AD for Scaden
+adata.write("pf_ref/scaden_input_pf.h5ad")
+
+# Create gene list for filtering
+genes = adata.var_names.tolist()
+
+with open("pf_ref/genes_from_h5ad.txt", "w") as f:
+    f.write("\n".join(genes))
+
+# For scaden simulate
+
+# Extract counts
+counts_df = pd.DataFrame(adata.X, index=adata.obs.index, columns=adata.var.index)
+counts_df_reset = counts_df.reset_index()
+counts_df_clean = counts_df_reset.drop(columns=['CELL_ID'])
+counts_df_clean.to_csv("pf_ref/scaden_counts.txt", sep="\t")
+
+# Extract cell types
+celltypes_df = adata.obs['cell_type']
+celltypes_df.to_csv("pf_ref/scaden_celltypes.txt", index=False, header=["Celltype"])
+```
+
+
+
+## Normalise, reformat and filter (by SC) RNA-seq data for Scaden
+Normalize your P. knowlesi expression data to TPM, log2(TPM+1), or variance-stabilized values (like with DESeq2 vst()).
+Subset your data to only include genes that have mapped Pf orthologs.
+
+
+```{R,eval=F}
+library(tidyverse)
+library(GenomicFeatures)
+library(biomaRt)
+library(purrr)
+
+# Set up
+star_dir <- "/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_assembly_2/output/mapped"  # STAR output
+gtf_file <- "/g/data/pq84/malaria/Pk_trancsriptomics/smk_trinity_unique_trans/output/genome_annotation/PlasmoDB-68_PknowlesiA1H1.gtf"
+use_column <- 4  # STAR column: 4 = stranded reverse (RF)
+output_file <- "pf_ref/scaden_input_tpm.txt"  # <-- Output for Scaden
+
+# Get STAR output files
+star_files <- list.files(star_dir, pattern = "ReadsPerGene.out.tab$", full.names = TRUE)
+
+# Extract gene lengths from GTF
+txdb <- makeTxDbFromGFF(gtf_file)
+gene_lengths <- genes(txdb) %>%
+  as_tibble() %>%
+  mutate(gene_length = width) %>%
+  dplyr::select(gene_id, gene_length)
+
+# Read STAR gene count data
+read_star_file <- function(file, col = use_column) {
+  sample_name <- gsub("_ReadsPerGene.out.tab", "", basename(file))
+  df <- read_tsv(file, col_names = FALSE, skip = 4, show_col_types = FALSE)
+  tibble(gene_id = df$X1, !!sample_name := df[[col]])
+}
+
+# Merge all count tables
+expr_list <- lapply(star_files, read_star_file)
+counts_long <- expr_list[[1]]
+for (i in 2:length(expr_list)) {
+  counts_long <- full_join(counts_long, expr_list[[i]], by = "gene_id")
+}
+counts_long <- drop_na(counts_long)
+
+# Add gene lengths
+counts_long <- counts_long %>%
+  left_join(gene_lengths, by = "gene_id") %>%
+  filter(!is.na(gene_length)) %>%
+  group_by(gene_id) %>%
+  summarize(across(where(is.numeric), sum), gene_length = mean(gene_length), .groups = "drop")
+
+# Convert A1H1 gene IDs to 3D7
+ortholog_map <- read.table("pf_ref/orthologs_pk_pf.txt", sep = "\t", header = TRUE) %>%
+  rename_with(~ str_replace_all(., "\\.", "_")) %>% 
+  dplyr::select(Gene_ID_Pk, Gene_ID_Pf)
+
+counts_long <- counts_long %>%
+  left_join(ortholog_map, by = c("gene_id" = "Gene_ID_Pk")) %>%
+  filter(!is.na(Gene_ID_Pf)) %>%
+  mutate(gene_id = Gene_ID_Pf) %>%
+  dplyr::select(-Gene_ID_Pf)
+
+# Calculate TPM
+count_cols <- setdiff(names(counts_long), c("gene_id", "gene_length"))
+counts_mat <- as.matrix(counts_long[, count_cols])
+length_kb <- counts_long$gene_length / 1000
+rpk <- sweep(counts_mat, 1, length_kb, FUN = "/")
+scaling_factors <- colSums(rpk) / 1e6
+tpm <- sweep(rpk, 2, scaling_factors, FUN = "/")
+rownames(tpm) <- counts_long$gene_id
+
+# Filter by SC data
+tpm_df <- cbind(Gene = counts_long$gene_id, as.data.frame(tpm)) %>% 
+    mutate(Gene = str_replace(Gene, "_", "-")) # Fix gene names
+sc_genes <- readLines("pf_ref/genes_from_h5ad.txt")  # OR read.table(...)[[1]]
+tpm_df_filtered <- tpm_df %>%
+  filter(Gene %in% sc_genes) %>% 
+  as.data.frame() 
+
+# Save in Scaden format: genes as rows, samples as columns
+write.table(tpm_df_filtered, file = output_file, sep = "\t", quote = FALSE, col.names = TRUE, row.names = FALSE)
+```
+
+
+## Filter SC by bulk 
+
+```{python,eval=F}
+import pandas as pd
+import scanpy as sc
+from anndata import AnnData
+
+adata = sc.read_h5ad("pf_ref/scaden_input_pf.h5ad")
+bulk_genes = set(pd.read_csv("pf_ref/scaden_input_tpm.txt", sep="\t")["Gene"])
+adata = adata[:, adata.var_names.isin(bulk_genes)].copy()
+adata.write("pf_ref/scaden_input_pf_filtered.h5ad")
+```
+
+
+## Run scaden - 10 iterations
+
+```{R,eval=F}
+#!/bin/bash
+#PBS -P pq84
+#PBS -q normalbw
+#PBS -N scaden
+#PBS -j oe
+#PBS -m ae
+#PBS -l walltime=48:00:00,mem=80GB,ncpus=10
+#PBS -l storage=gdata/pq84+scratch/pq84
+#PBS -M jacob.westaway@menzies.edu.au
+
+echo "---------------------------------------"
+echo "PBS: Job identifier is $PBS_JOBID"
+echo "PBS: Job name is $PBS_JOBNAME"
+echo "---------------------------------------"
+
+echo "Sourcing modules and activating environment"
+module load R/4.3.1 
+export R_LIBS=/home/588/jw1542/.local/lib/R_4.3:$R_LIBS
+source /g/data/pq84/malaria/boxes/scaden/bin/activate 
+
+cd /g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping
+
+echo "Starting Scaden pipeline"
+set -e
+
+patternRef="scaden"      # *celltypes.txt and *counts.txt files(without extension)
+patternBulk="scaden_input_tpm"             # .txt file (without extension)
+
+dirRef="pf_ref"
+dirBulk="pf_ref"
+dirSimul="temp/scaden_simulated_data"
+dirModel="temp/scaden_trained_models"
+dirPrediction="${dirRef}/scaden_predictions/${patternRef}"
+
+mkdir -p "${dirPrediction}"
+mkdir -p "${dirSimul}"
+mkdir -p "${dirModel}"
+
+for i in $(seq 1 10)
+do
+  echo "Starting iteration $i..."
+
+  echo "Simulating mixtures..."
+  scaden simulate -n 1000 --pattern "*_counts.txt" --data "${dirRef}" --out "$dirSimul"
+
+  echo "Processing data for Scaden..."
+  scaden process "${dirSimul}/${patternRef}.h5ad" "${dirBulk}/${patternBulk}.txt" \
+    --processed_path "${dirSimul}/processed.h5ad"
+
+  echo "Training model..."
+  scaden train "${dirSimul}/processed.h5ad" --steps 5000 --model_dir "$dirModel"
+
+  echo "Predicting cell fractions..."
+  scaden predict --model_dir "$dirModel" "${dirBulk}/${patternBulk}.txt" \
+    --outname "${patternRef}_n${i}"
+
+  echo "Saving prediction: ${patternRef}_n${i} → ${dirPrediction}"
+  mv "${patternRef}_n${i}" "${dirPrediction}"
+
+  echo "Cleaning up"
+  rm -rf "${dirSimul:?}/"*
+  rm -rf "${dirModel:?}/"*
+
+  echo "Finished iteration $i"
+done
+
+echo "---------------------------------------"
+echo "All $((end - start + 1)) iterations completed successfully!"
+echo "Final predictions saved in: ${dirPrediction}"
+echo "---------------------------------------"
+```
+
+
+
+## Get the mean proportions for each of the 10 iterations
+
+```{R,eval=F}
+library(tidyverse)
+
+# List all prediction files matching pattern
+files <- list.files(pattern = "^scaden_n[0-9]+$", path = "pf_ref/scaden_predictions/scaden", full.names = TRUE)
+
+# Plotting
+# Read in each file and annotate with run number
+scaden_all <- map2_dfr(files, seq_along(files), ~{
+    read_tsv(.x, show_col_types = FALSE) %>%
+        rename(sample_id = 1) %>%
+        janitor::clean_names() %>%  
+        pivot_longer(-sample_id, names_to = "cell_type", values_to = "proportion") %>%
+        mutate(run = paste0("run_", .y))
+})
+
+scaden_mean_df <- scaden_all %>%
+    group_by(sample_id, cell_type) %>%
+    summarise(proportion = mean(proportion), .groups = "drop") %>%
+    pivot_wider(names_from = cell_type, values_from = proportion)
+
+write_tsv(scaden_mean_df, "pf_ref/scaden_mean_proportions.txt")
+
+
+# Plot mean proportions for each sample
+export_plot <- scaden_mean_df %>%
+    arrange(desc(trophozoite)) %>%
+    add_column(plot_id = 1:nrow(.)) %>%
+    pivot_longer(cols = -c(sample_id, plot_id), names_to = "celltype", values_to = "proportion") %>%
+    ggplot(aes(x = plot_id, y = proportion, fill = celltype)) +
+        geom_col() +
+        theme(axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank(), 
+            axis.title = element_text(size = 16),
+            axis.text = element_text(size = 14),
+            legend.title = element_text(size = 16),
+            legend.text = element_text(size = 14)
+        ) +
+        scale_fill_manual(
+            name = "Cell Type",
+            values = c(
+                "ring" = "#d44842",
+                "schizont" = "#73D055FF",
+                "trophozoite" = "#440154FF",
+                "gametocyte_developing" = "#22a884",
+                "gametocyte_female" = "#FDE725FF",
+                "gametocyte_male" = "#414487"
+            )
+        ) +
+        xlab("Sample") +
+        ylab("Proportion of cell type") 
+
+ggsave(export_plot, filename = "pf_ref/scaden_mean_proportions.png", width = 15, height = 6, dpi = 300)
+
+
+# Plot all data points
+export_plot <- ggplot(scaden_all, aes(x = sample_id, y = proportion, color = cell_type)) +
+    geom_point(position = position_jitterdodge(jitter.width = 0.25, dodge.width = 0.6), alpha = 0.7, size = 1.5) +
+    facet_wrap(~cell_type) +
+    labs(
+        x = "Sample ID",
+        y = "Predicted proportion"
+    ) +
+    theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        strip.text = element_text(size = 16)
+    ) +
+    scale_colour_manual(
+        name = "Cell Type",
+        values = c(
+            "ring" = "#d44842",
+            "schizont" = "#73D055FF",
+            "trophozoite" = "#440154FF",
+            "gametocyte_developing" = "#22a884",
+            "gametocyte_female" = "#FDE725FF",
+            "gametocyte_male" = "#414487"
+        )
+    )
+
+ggsave(export_plot, filename = "pf_ref/scaden_all_predictions.png", width = 10, height = 6, dpi = 300)
+
+
+# Calculate summary
+scaden_summary <- scaden_all %>%
+  group_by(sample_id, cell_type) %>%
+  summarise(
+    mean = mean(proportion),
+    sd = sd(proportion),
+    min = min(proportion),
+    max = max(proportion),
+    .groups = "drop"
+  )
+
+#  Scaden Prediction Range per Sample (Min-Max)
+export_plot <- scaden_summary %>%
+  ggplot(aes(x = sample_id, y = mean, colour = cell_type)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = min, ymax = max), width = 0.2) +  # range
+    facet_wrap(~ cell_type) +
+    ylab("Predicted Proportion") +
+    xlab("Sample") +
+    theme(axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        legend.position = "none",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        strip.text = element_text(size = 16)
+    ) +
+    scale_colour_manual(
+        name = "Cell Type",
+        values = c(
+            "ring" = "#d44842",
+            "schizont" = "#73D055FF",
+            "trophozoite" = "#440154FF",
+            "gametocyte_developing" = "#22a884",
+            "gametocyte_female" = "#FDE725FF",
+            "gametocyte_male" = "#414487"
+        )
+    )
+
+
+ggsave(export_plot, filename = "pf_ref/scaden_summary.png", width = 16, height = 6, dpi = 300)
+
+
+# Group gametocytes together and plot
+export_plot <- scaden_mean_df %>%
+    arrange(desc(trophozoite)) %>%
+    add_column(plot_id = 1:nrow(.)) %>%
+    pivot_longer(cols = -c(sample_id, plot_id), names_to = "celltype", values_to = "proportion") %>%
+        mutate(celltype = case_when(
+        str_detect(celltype, "gametocyte") ~ "gametocyte",
+        TRUE ~ celltype
+    )) %>%
+    group_by(plot_id, sample_id, celltype) %>%
+    summarise(proportion = sum(proportion), .groups = "drop") %>%
+    ggplot(aes(x = plot_id, y = proportion, fill = celltype)) +
+        geom_col() +
+        theme(axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank(), 
+            axis.title = element_text(size = 16),
+            axis.text = element_text(size = 14),
+            legend.title = element_text(size = 16),
+            legend.text = element_text(size = 14)
+        ) +
+        scale_fill_manual(
+            name = "Cell Type",
+            values = c(
+                "ring" = "#d44842",
+                "schizont" = "#73D055FF",
+                "trophozoite" = "#440154FF",
+                "gametocyte" = "#365c8d"
+            )
+        ) +
+        xlab("Sample") +
+        ylab("Proportion of cell type") 
+
+ggsave(export_plot, filename = "pf_ref/scaden_mean_proportions_gametocyte_collapsed.png", width = 15, height = 6, dpi = 300)
+
+# Sexual vs asexual
+
+export_plot <- scaden_mean_df %>%
+    pivot_longer(cols = -sample_id, names_to = "celltype", values_to = "proportion") %>%
+    mutate(stage_group = case_when(
+        str_detect(celltype, "gametocyte") ~ "sexual",
+        celltype %in% c("ring", "trophozoite", "schizont") ~ "asexual",
+        TRUE ~ celltype
+    )) %>%
+    group_by(sample_id, stage_group) %>%
+    summarise(proportion = sum(proportion), .groups = "drop") %>%
+    pivot_wider(names_from = stage_group, values_from = proportion) %>%
+    arrange(desc(asexual)) %>%
+    mutate(plot_id = row_number()) %>%
+    pivot_longer(cols = c(sexual, asexual), names_to = "stage_group", values_to = "proportion") %>%
+    mutate(stage_group = factor(stage_group, levels = c("sexual", "asexual"))) %>% 
+    ggplot(aes(x = plot_id, y = proportion, fill = stage_group)) +
+        geom_col() +
+        theme(
+            axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank(), 
+            axis.title = element_text(size = 16),
+            axis.text = element_text(size = 14),
+            legend.title = element_text(size = 16),
+            legend.text = element_text(size = 14)
+        ) +
+        scale_fill_manual(
+            name = "Parasite Stage",
+            values = c(
+                "asexual" = "#f57d15",
+                "sexual" = "#280b53"
+            )
+        ) +
+        xlab("Sample") +
+        ylab("Proportion of stage")
+
+ggsave(export_plot, filename = "pf_ref/scaden_mean_proportions_sexual_vs_asexual.png", width = 15, height = 6, dpi = 300)
+```
+
+
+# Relationship between IDC and severity?
+
+```{R,eval=F}
+library(tidyverse)
+
+# Pk reference data
+
+# Combine IDC and metadata
+
+idc_df <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pk_ref/scaden_mean_proportions.txt") %>% 
+    pivot_longer(cols = -sample_id, names_to = "celltype", values_to = "proportion") %>% 
+    group_by(sample_id) %>%
+    slice_max(order_by = proportion, n = 1) %>%
+    ungroup() %>% 
+    select(-proportion) %>%
+    left_join(
+        read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pk_ref/scaden_mean_proportions.txt")
+    ) %>%
+    mutate(sample_id = str_replace(sample_id, "-", "_"))
+
+meta_idc_combined <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/full_meta_for_de.tsv") %>%
+    dplyr::rename(sample = file) %>%
+    mutate(sample_id = str_remove(sample, ".txt")) %>%
+    left_join(
+        idc_df,
+        by = "sample_id"
+  )
+
+# Testing proportions
+wilcox.test(schizont ~ sevemal, data = meta_idc_combined)
+wilcox.test(ring ~ sevemal, data = meta_idc_combined)
+wilcox.test(trophozoite ~ sevemal, data = meta_idc_combined)
+
+# Adjust p-values (e.g., Benjamini-Hochberg)
+p_vals <- c(
+  wilcox.test(schizont ~ sevemal, data = meta_idc_combined)$p.value,
+  wilcox.test(ring ~ sevemal, data = meta_idc_combined)$p.value,
+  wilcox.test(trophozoite ~ sevemal, data = meta_idc_combined)$p.value
+)
+
+p.adjust(p_vals, method = "BH")
+
+# Testing dominant cell types
+meta_idc_combined %>%
+  filter(celltype != "ring") %>%
+  { chisq.test(table(.$sevemal, .$celltype)) }
+
+fisher.test(table(meta_idc_combined$sevemal, meta_idc_combined$celltype))
+
+## What cell types are contributing to the difference - get residuals of chisq test
+## Create contingency table
+tab <- table(meta_idc_combined$sevemal, meta_idc_combined$celltype)
+
+## Use chisq.test to get residuals
+chisq_result <- chisq.test(tab)
+
+## View standardized residuals
+std_res <- chisq_result$stdres
+print(round(std_res, 2))
+
+
+# Testing association between proportions and parasite density
+
+correlate_para <- function(df) {
+  df_log <- df %>%
+    mutate(parasitemia = log10(parasitemia + 1))
+
+  tibble(
+    life_stage = c("schizont", "ring", "trophozoite"),
+    data = list(
+      df_log %>% filter(schizont > 0),
+      df_log %>% filter(ring > 0),
+      df_log %>% filter(trophozoite > 0)
+    )
+  ) %>%
+    mutate(cor_test = map2(data, life_stage, ~ cor.test(.x$parasitemia, .x[[.y]], method = "spearman") %>% 
+    broom::tidy())) %>%
+    unnest(cor_test) %>%
+    select(-data)
+}
+
+cor_results <- correlate_para(meta_idc_combined)
+print(cor_results)
+
+## Identify stage with strongest correlation (by absolute rho)
+top_stage <- cor_results %>%
+  mutate(abs_rho = abs(estimate)) %>%
+  arrange(desc(abs_rho)) %>%
+  slice(1)
+
+## Plotting
+stage_name <- top_stage$life_stage
+rho <- round(top_stage$estimate, 2)
+pval <- signif(top_stage$p.value, 3)
+
+export_plot <- meta_idc_combined %>%
+  mutate(log_parasitemia = log10(parasitemia + 1)) %>%
+  ggplot(aes_string(x = "log_parasitemia", y = stage_name)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", color = "steelblue", se = FALSE) +
+  labs(
+    title = paste("Spearman correlation:", stage_name),
+    subtitle = paste0("rho = ", rho, ", p = ", pval),
+    x = "Log10(Parasitemia + 1)",
+    y = paste("Proportion of", stage_name)
+  )
+
+ggsave(export_plot, filename = "pk_ref/spearmen_cor_parasitemia.png", width =6, height = 6, dpi = 300)
+
+export_plot <- meta_idc_combined %>%
+  group_by(sevemal) %>%
+  summarise(
+    schizont = mean(schizont, na.rm = TRUE),
+    ring = mean(ring, na.rm = TRUE),
+    trophozoite = mean(trophozoite, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = -sevemal, names_to = "celltype", values_to = "mean_proportion") %>%
+  na.omit() %>%
+  ggplot(aes(x = sevemal, y = mean_proportion, fill = celltype)) +
+    geom_col() +
+    labs(
+      x = "Severity",
+      y = "Mean Proportion"
+    ) +
+    scale_fill_manual(values = c("schizont" = "#73D055FF", "ring" = "#d44842", "trophozoite" = "#440154FF"))
+
+# Save the plot
+ggsave(export_plot, filename = "pk_ref/mean_proportions_by_severity.png", width = 8, height = 6, dpi = 300)
+
+
+# Pf reference data
+idc_df <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pf_ref/scaden_mean_proportions.txt") %>% 
+    pivot_longer(cols = -sample_id, names_to = "celltype", values_to = "proportion") %>% 
+    group_by(sample_id) %>%
+    slice_max(order_by = proportion, n = 1) %>%
+    ungroup() %>% 
+    select(-proportion) %>%
+    left_join(
+        read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/idc_mapping/pf_ref/scaden_mean_proportions.txt")
+    ) %>%
+    mutate(sample_id = str_replace(sample_id, "-", "_"))
+
+meta_idc_combined <- read_tsv("/g/data/pq84/malaria/Pk_trancsriptomics/outputs/analyses/full_meta_for_de.tsv") %>%
+    dplyr::rename(sample = file) %>%
+    mutate(sample_id = str_remove(sample, ".txt")) %>%
+    left_join(
+        idc_df,
+        by = "sample_id"
+  )
+
+# Testing proportions
+wilcox.test(schizont ~ sevemal, data = meta_idc_combined)
+wilcox.test(ring ~ sevemal, data = meta_idc_combined)
+wilcox.test(trophozoite ~ sevemal, data = meta_idc_combined)
+wilcox.test(gametocyte_female ~ sevemal, data = meta_idc_combined)
+wilcox.test(gametocyte_male ~ sevemal, data = meta_idc_combined)
+wilcox.test(gametocyte_developing ~ sevemal, data = meta_idc_combined)
+meta_idc_combined %>% 
+  mutate(gametocyte_total = gametocyte_developing + gametocyte_male + gametocyte_female) %>%
+  wilcox.test(gametocyte_total ~ sevemal, data = .)
+
+
+# Adjust p-values (e.g., Benjamini-Hochberg)
+p_vals <- c(
+    wilcox.test(schizont ~ sevemal, data = meta_idc_combined)$p.value,
+    wilcox.test(ring ~ sevemal, data = meta_idc_combined)$p.value,
+    wilcox.test(trophozoite ~ sevemal, data = meta_idc_combined)$p.value,
+    wilcox.test(gametocyte_female ~ sevemal, data = meta_idc_combined)$p.value,
+    wilcox.test(gametocyte_male ~ sevemal, data = meta_idc_combined)$p.value,
+    wilcox.test(gametocyte_developing ~ sevemal, data = meta_idc_combined)$p.value
+)
+
+p.adjust(p_vals, method = "BH")
+
+# Testing sexual and asexual proportions
+sexual_stage <- meta_idc_combined %>%
+    mutate(sexual = gametocyte_female + gametocyte_male + gametocyte_developing,
+        asexual = schizont + ring + trophozoite) 
+
+wilcox.test(sexual ~ sevemal, data = sexual_stage)
+wilcox.test(asexual ~ sevemal, data = sexual_stage)
+
+# Testing dominant cell types
+meta_idc_combined %>%
+  { chisq.test(table(.$sevemal, .$celltype)) }
+
+fisher.test(table(meta_idc_combined$sevemal, meta_idc_combined$celltype))
+
+# What cell types are contributing to the difference - get residuals of chisq test
+
+## Filter low-count categories if needed
+meta_filt <- meta_idc_combined %>%
+  filter(celltype != "schizont" & celltype != "ring" & celltype != "gametocyte (male)") # adjust as needed
+
+## Create contingency table
+tab <- table(meta_filt$sevemal, meta_filt$celltype)
+
+## Use chisq.test to get residuals
+chisq_result <- chisq.test(tab)
+
+## View standardized residuals
+std_res <- chisq_result$stdres
+print(round(std_res, 2))
+
+
+# Testing association between proportions and parasite density
+
+correlate_para <- function(df) {
+  df_log <- df %>%
+    mutate(
+      parasitemia = log10(parasitemia + 1),
+      gametocyte_total = gametocyte_developing + gametocyte_male + gametocyte_female
+    )
+
+  tibble(
+    life_stage = c(
+      "schizont", "ring", "trophozoite",
+      "gametocyte_developing", "gametocyte_male", "gametocyte_female",
+      "gametocyte_total"
+    ),
+    data = list(
+      df_log %>% filter(schizont > 0),
+      df_log %>% filter(ring > 0),
+      df_log %>% filter(trophozoite > 0),
+      df_log %>% filter(gametocyte_developing > 0),
+      df_log %>% filter(gametocyte_male > 0),
+      df_log %>% filter(gametocyte_female > 0),
+      df_log %>% filter(gametocyte_total > 0)
+    )
+  ) %>%
+    mutate(cor_test = map2(data, life_stage, ~ cor.test(.x$parasitemia, .x[[.y]], method = "spearman") %>% 
+                             broom::tidy())) %>%
+    unnest(cor_test) %>%
+    select(-data)
+}
+
+cor_results <- correlate_para(meta_idc_combined)
+
+# Plot correlations
+
+# Adjust significance threshold if needed
+sig_threshold <- 0.05
+
+
+# Label outliers
+meta_idc_combined <- meta_idc_combined %>%
+  mutate(
+    log_parasitemia = log10(parasitemia + 1),
+    gametocyte_total = gametocyte_developing + gametocyte_male + gametocyte_female,
+    outlier = log_parasitemia < 2
+  ) %>%
+  filter(!is.na(outlier))
+
+# Filter significant correlations
+significant_stages <- cor_results %>%
+  filter(p.value < sig_threshold)
+
+# Generate plots
+plots <- purrr::pmap(significant_stages, function(life_stage, estimate, p.value, ...) {
+
+  rho <- round(estimate, 2)
+  pval <- signif(p.value, 3)
+
+  ggplot(meta_idc_combined, aes(x = log_parasitemia, y = .data[[life_stage]], color = outlier)) +
+    geom_point(alpha = 0.8) +
+    geom_smooth(method = "lm", color = "black", se = FALSE) +
+    scale_color_manual(values = c("TRUE" = "#f57d15", "FALSE" = "#65156e")) +
+    labs(
+      subtitle = paste0("rho = ", rho, ", p = ", pval),
+      x = "Log10(Parasitemia)",
+      y = paste("Proportion of", str_replace(life_stage, "_", " ")),
+      color = "Outliers"
+    )
+})
+
+# Save each plot
+walk2(plots, significant_stages$life_stage, ~{
+  ggsave(
+    plot = .x,
+    filename = paste0("pf_ref/spearman_cor_parasitemia_", .y, ".png"),
+    width = 10, height = 6, dpi = 300
+  )
+})
+
+# Re-run analysis with outliers removed
+correlate_para_filtered <- function(df) {
+  df_log <- df %>%
+    mutate(
+        parasitemia_log = log10(parasitemia + 1),
+        gametocyte_total = gametocyte_developing + gametocyte_male + gametocyte_female
+    ) %>%
+    filter(parasitemia_log >= 2)
+
+    tibble(
+        life_stage = c(
+            "schizont", "ring", "trophozoite",
+            "gametocyte_developing", "gametocyte_male", "gametocyte_female",
+            "gametocyte_total"
+    ),
+    data = list(
+        df_log %>% filter(schizont > 0),
+        df_log %>% filter(ring > 0),
+        df_log %>% filter(trophozoite > 0),
+        df_log %>% filter(gametocyte_developing > 0),
+        df_log %>% filter(gametocyte_male > 0),
+        df_log %>% filter(gametocyte_female > 0),
+        df_log %>% filter(gametocyte_total > 0)
+    )
+    ) %>%
+    mutate(cor_test = map2(data, life_stage, ~ cor.test(.x$parasitemia_log, .x[[.y]], method = "spearman") %>% 
+                             broom::tidy())) %>%
+    unnest(cor_test) %>%
+    select(-data)
+}
+
+correlate_para_filtered(meta_idc_combined)
+
+write_tsv(correlate_para_filtered(meta_idc_combined), "pf_ref/spearmen_correlations.txt")
+
+
+export_plot <- meta_idc_combined %>%
+  group_by(sevemal) %>%
+  summarise(
+    schizont = mean(schizont, na.rm = TRUE),
+    ring = mean(ring, na.rm = TRUE),
+    trophozoite = mean(trophozoite, na.rm = TRUE),
+    gametocyte_developing = mean(gametocyte_developing, na.rm = TRUE),
+    gametocyte_female = mean(gametocyte_female, na.rm = TRUE),
+    gametocyte_male = mean(gametocyte_male, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -sevemal,
+    names_to = "celltype",
+    values_to = "mean_proportion"
+  ) %>%
+  na.omit() %>%
+  ggplot(aes(x = sevemal, y = mean_proportion, fill = celltype)) +
+    geom_col() +
+    labs(
+      x = "Severity",
+      y = "Mean Proportion"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "schizont" = "#73D055FF",
+        "ring" = "#d44842",
+        "trophozoite" = "#440154FF",
+        "gametocyte_developing" = "#22a884",
+        "gametocyte_female" = "#FDE725FF",
+        "gametocyte_male" = "#414487"
+      )
+    )
+
+# Save the plot
+ggsave(export_plot, filename = "pf_ref/mean_proportions_by_severity.png", width = 8, height = 6, dpi = 300)
+
+
+# Do low parasitemia samples have gametocytes?
+meta_idc_combined %>% 
+    filter(parasitemia < 1500) %>% 
+    select(parasitemia, gametocyte_total, studyid) %>%
+    arrange(parasitemia) %>%
+    write_tsv("pf_ref/low_parasitemia_gametocytes.txt")
+
+meta_idc_combined_long <- meta_idc_combined %>%
+    mutate(low_parasitemia = parasitemia < 1500) %>%
+    filter(parasitemia < 10000) %>%
+    pivot_longer(
+        cols = c(gametocyte_developing, gametocyte_male, gametocyte_female, gametocyte_total),
+        names_to = "gametocyte_type",
+        values_to = "proportion"
+    )
+
+# Plot
+export_plot <- ggplot(meta_idc_combined_long, aes(x = parasitemia, y = proportion, color = low_parasitemia)) +
+    geom_point(alpha = 0.7) +
+    facet_wrap(~ gametocyte_type, labeller = labeller(gametocyte_type = function(x) gsub("_", " ", x))) +
+    scale_color_manual(values = c("TRUE" = "#f57d15", "FALSE" = "#65156e"), name = "Parasitemia > 1.5K") +
+    scale_x_continuous(
+        name = "Parasitemia (subset to < 10K)",
+        breaks = c(seq(0, 1000, by = 500), seq(2000, 10000, by = 1000))
+    ) +
+    labs(y = "Proportion") +
+    theme(
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        strip.text = element_text(size = 16)
+    )
+
+ggsave(export_plot, filename = "pf_ref/low_parasitemia_gametocytes.png", width = 15, height = 6, dpi = 300)
+```
+
+

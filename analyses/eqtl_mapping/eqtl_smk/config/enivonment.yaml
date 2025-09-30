@@ -1,0 +1,10 @@
+name: all
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12.11
+  - pandas
+  - pip
+  - pip:
+      - fastlmm

@@ -1,0 +1,154 @@
+####################################### Snakefile #########################################
+
+# Load config
+configfile: "config/config.yaml"
+eqtl_dir = config["eqtl_dir"]
+
+# Dynamically extract gene list from expression matrix in eqtl_dir
+import pandas as pd
+genes = pd.read_csv(eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv", sep="\t", nrows=0).columns[2:].tolist()
+
+# Final outputs
+rule all:
+	input:
+		expand("{eqtl_dir}results/eqtl_results/manhattan_{gene}.png", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/qq_{gene}.png", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/lambda_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/sig_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir),
+		expand("{eqtl_dir}results/eqtl_results/suggestive_snps_{gene}.txt", gene=genes, eqtl_dir=eqtl_dir)
+
+# Rule to generate Manhattan, QQ plots and stats
+rule plot_fastlmm:
+	input:
+		result = eqtl_dir + "results/eqtl_results/{gene}.tsv",
+		bim = eqtl_dir + "cleaned_overlap.bim"
+	output:
+		manhattan = eqtl_dir + "results/eqtl_results/manhattan_{gene}.png",
+		qq = eqtl_dir + "results/eqtl_results/qq_{gene}.png",
+		lambda_ = eqtl_dir + "results/eqtl_results/lambda_{gene}.txt",
+		sig = eqtl_dir + "results/eqtl_results/sig_snps_{gene}.txt",
+		suggestive = eqtl_dir + "results/eqtl_results/suggestive_snps_{gene}.txt"
+	resources:
+		jobname = lambda wildcards: f"smk-plot-{wildcards.gene}",
+		ncpus = 2,
+		mem = "16GB",
+		walltime = "2:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		r"""
+		if [ $(wc -l < {input.result}) -le 1 ]; then
+			touch {output.manhattan} {output.qq} {output.lambda_} {output.sig} {output.suggestive}
+			echo "Skipping plot for {wildcards.gene}: empty result file."
+		else
+			Rscript scripts/plot_fastlmm_results.R {input.result} {input.bim}
+		fi
+		"""
+
+# Main rule to run one eQTL model per gene
+rule run_fastlmm:
+	input:
+		expr = eqtl_dir + "fastlmm_expression_matrix_filtered_a1h1.tsv",
+		covar = eqtl_dir + "fastlmm_joint_covariates.tsv",
+		ld_bed = eqtl_dir + "cleaned_overlap_ld.bed",
+		bed   = eqtl_dir + "plink_subsets/{gene}.bed",
+		bim   = eqtl_dir + "plink_subsets/{gene}.bim",
+		fam   = eqtl_dir + "plink_subsets/{gene}.fam"
+
+	output:
+		result = temp(eqtl_dir + "results/eqtl_results/{gene}.tsv")
+	params:
+		gene = "{gene}",
+		eqtl_dir = eqtl_dir
+	resources:
+		jobname = lambda wildcards: f"smk-fastlmm-{wildcards.gene}",
+		ncpus = 5,
+		mem = "40GB",
+		walltime = "2:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	shell:
+		r"""
+		if [ $(wc -l < {input.bim}) -le 1 ]; then
+			echo -e "SNP\tPValue" > {output.result}
+			echo "Skipping {params.gene}: no SNPs in region."
+		else
+			python scripts/run_fastlmm.py \
+				--pheno-gene {params.gene} \
+				--expr-matrix {input.expr} \
+				--covar {input.covar} \
+				--ld-bed-covar {input.ld_bed}
+				--plink-prefix {params.eqtl_dir}plink_subsets/{params.gene} \
+				--out {output.result}
+		fi
+		"""
+
+# Rule to subset PLINK files to 10kb window around the gene
+rule subset_plink_for_gene:
+	input:
+		bim = eqtl_dir + "cleaned_overlap.bim",
+		fam = eqtl_dir + "cleaned_overlap.fam",
+		bed = eqtl_dir + "cleaned_overlap.bed",
+		pos = eqtl_dir + "gene_positions.tsv"
+	output:
+		bed = eqtl_dir + "plink_subsets/{gene}.bed",
+		bim = eqtl_dir + "plink_subsets/{gene}.bim",
+		fam = eqtl_dir + "plink_subsets/{gene}.fam"
+	params:
+		gene = "{gene}",
+		eqtl_dir = eqtl_dir
+	resources:
+		jobname = lambda wildcards: f"smk-plink-{wildcards.gene}",
+		ncpus = 2,
+		mem = "16GB",
+		walltime = "2:00:00",
+		storage = "gdata/pq84+scratch/pq84",
+		account = "jw1542",
+		queue = "normalbw",
+		email = "jacob.westaway@menzies.edu.au",
+		mailon = "a",
+		jobout = "oe"
+	run:
+		import pandas as pd
+		import os
+		from pathlib import Path
+
+		# Read position data
+		pos_df = pd.read_csv(input.pos, sep="\t")
+		row = pos_df[pos_df["trinity"] == wildcards.gene]
+		if row.empty:
+			raise ValueError(f"Gene {wildcards.gene} not found in gene_positions.tsv")
+
+		# Extract and sanitize region
+		chrom = row["chr_plink"].values[0]
+		start = int(row["start"].values[0]) - 10000
+		end = int(row["end"].values[0]) + 10000
+		start = max(start, 0)
+
+		# Output prefix
+		output_prefix = f"{params.eqtl_dir}plink_subsets/{wildcards.gene}"
+
+		# Run PLINK subset
+		# Run PLINK subset (allow failure)
+		shell(
+			f"plink --bfile {params.eqtl_dir}cleaned_overlap "
+			f"--chr {chrom} --from-bp {start} --to-bp {end} "
+			f"--make-bed --out {output_prefix} --allow-extra-chr",
+			allow_nonzero_exit_code=True
+		)
+		# Failsafe: check if output files were generated
+		expected_files = [output.bed, output.bim, output.fam]
+		missing = [f for f in expected_files if not Path(f).exists()]
+
+		if missing:
+			for f in expected_files:
+				Path(f).touch()
+			print(f"No SNPs found for gene {wildcards.gene}. Dummy files created to prevent pipeline crash.")

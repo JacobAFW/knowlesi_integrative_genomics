@@ -1,0 +1,16 @@
+__default__:
+  jobname: "smk-{rule}-{wildcards.gene}"
+  ncpus: 1
+  mem_mb: 8000
+  walltime: "12:00:00"
+  storage: "gdata/pq84+scratch/pq84"
+  account: "jw1542"
+  queue: "normalbw"
+  email: "jacob.westaway@menzies.edu.au"
+  mailon: "a"
+  jobout: "oe"
+
+run_fastlmm:
+  jobname: "smk-fastlmm-{wildcards.gene}"
+  ncpus: 5
+  mem_mb: 40000
